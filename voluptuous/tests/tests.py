@@ -44,15 +44,18 @@ from voluptuous import (
     NotInInvalid,
     Number,
     Object,
+    Opt,
     Optional,
     PathExists,
     Range,
     Remove,
+    Repeat,
     Replace,
     Required,
     Schema,
     SchemaError,
     Self,
+    SequencePattern,
     SomeOf,
     TooManyValid,
     TypeInvalid,
@@ -84,6 +87,157 @@ def test_exact_sequence():
     with raises(Invalid):
         schema([1, 2, 3])
     assert schema([1, 2]) == [1, 2]
+
+
+def test_sequence_pattern_fixed_optional_repeat():
+    schema = Schema(
+        SequencePattern(['head', Opt('mark'), Repeat(int, min=1, max=3), 'tail'])
+    )
+    assert schema(['head', 'mark', 1, 2, 'tail']) == ['head', 'mark', 1, 2, 'tail']
+    assert schema(['head', 1, 'tail']) == ['head', 1, 'tail']
+    # input type is preserved
+    assert schema(('head', 1, 'tail')) == ('head', 1, 'tail')
+    with raises(Invalid, 'expected a list or tuple'):
+        schema('head')
+
+
+def test_sequence_pattern_boundary_segmentation():
+    """An element accepted by both the optional marker and the record rule
+    goes to the earlier segment (documented longest-match rule)."""
+
+    def tag(label):
+        def apply(d):
+            return (label, d['kind'], d['payload'])
+
+        return apply
+
+    marker = All({'kind': 'sync', 'payload': int}, tag('marker'))
+    record = All({'kind': Any('sync', 'data'), 'payload': int}, tag('record'))
+    schema = Schema(
+        SequencePattern(
+            [
+                {'kind': 'head'},
+                Opt(marker),
+                Repeat(record, min=1, max=4),
+                {'kind': 'tail'},
+            ]
+        )
+    )
+    # the sync element matches both Opt(marker) and Repeat(record);
+    # the earlier segment (the optional marker) consumes it
+    out = schema(
+        [
+            {'kind': 'head'},
+            {'kind': 'sync', 'payload': 1},
+            {'kind': 'data', 'payload': 2},
+            {'kind': 'tail'},
+        ]
+    )
+    assert out[1] == ('marker', 'sync', 1)
+    assert out[2] == ('record', 'data', 2)
+
+
+def test_sequence_pattern_missing_tail():
+    schema = Schema(
+        SequencePattern(['head', Opt('mark'), Repeat(int, min=1, max=3), 'tail'])
+    )
+    with pytest.raises(Invalid) as ctx:
+        schema(['head', 1, 2])
+    # the missing tail is reported at the element that took its place
+    assert ctx.value.path == [2]
+
+
+def test_sequence_pattern_too_few_records():
+    schema = Schema(
+        SequencePattern(['head', Repeat(int, min=2, max=4), 'tail'])
+    )
+    with raises(Invalid, 'expected at least 4 element(s), got 3'):
+        schema(['head', 1, 'tail'])
+    with raises(Invalid, 'expected at least 4 element(s), got 2'):
+        schema(['head', 'tail'])
+
+
+def test_sequence_pattern_inner_field_failure():
+    schema = Schema(
+        SequencePattern(
+            [
+                {'kind': 'head'},
+                Repeat({'kind': 'rec', 'payload': int}, min=1, max=4),
+                {'kind': 'tail'},
+            ]
+        )
+    )
+    with pytest.raises(Invalid) as ctx:
+        schema(
+            [
+                {'kind': 'head'},
+                {'kind': 'rec', 'payload': 1},
+                {'kind': 'rec', 'payload': 'x'},
+                {'kind': 'tail'},
+            ]
+        )
+    # the original element index is preserved, inner path is intact
+    assert ctx.value.path == [2, 'payload']
+
+
+def test_sequence_pattern_declaration_errors():
+    with raises(SchemaError):
+        SequencePattern([])
+    with raises(SchemaError):
+        SequencePattern([Repeat(int, min=3, max=1)])
+    with raises(SchemaError):
+        SequencePattern([Repeat(int, min=-1)])
+    with raises(SchemaError):
+        SequencePattern([Repeat(int, max=0)])
+    with raises(SchemaError):
+        SequencePattern([Opt(Opt(int))])
+    with raises(SchemaError):
+        SequencePattern([Repeat(Repeat(int))])
+
+
+def test_sequence_pattern_empty_and_overlong_fail_fast():
+    calls = []
+
+    def counting(x):
+        calls.append(x)
+        return x
+
+    schema = Schema(
+        SequencePattern(['head', Repeat(All(int, counting), min=1, max=3), 'tail'])
+    )
+    with raises(Invalid, 'expected at least 3 element(s), got 0'):
+        schema([])
+    with raises(Invalid, 'expected at most 5 element(s), got 6'):
+        schema(['head', 1, 2, 3, 4, 'tail'])
+    # no element was inspected for the length failures
+    assert calls == []
+    assert schema(['head', 1, 2, 'tail']) == ['head', 1, 2, 'tail']
+    # each element was converted exactly once
+    assert sorted(calls) == [1, 2]
+
+
+def test_sequence_pattern_no_repeated_side_effects():
+    calls = []
+
+    def counting(x):
+        calls.append(x)
+        return x
+
+    schema = Schema(
+        SequencePattern(
+            [Opt(All('mark', counting)), Repeat(All(int, counting), min=1, max=2)]
+        )
+    )
+    assert schema([1, 2]) == [1, 2]
+    # matching never re-executes a converter for backtracking
+    assert len(calls) == len(set(calls))
+    assert sorted(calls) == [1, 2]
+
+
+def test_sequence_pattern_msg_override():
+    schema = Schema(SequencePattern([int, Repeat(int, min=1)], msg='bad packet'))
+    with raises(Invalid, 'bad packet @ data[0]'):
+        schema(['x', 1])
 
 
 def test_required():

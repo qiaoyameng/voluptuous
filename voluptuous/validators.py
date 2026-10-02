@@ -31,6 +31,8 @@ from voluptuous.error import (
     NotInInvalid,
     PathInvalid,
     RangeInvalid,
+    SchemaError,
+    SequencePatternInvalid,
     TooManyValid,
     TrueInvalid,
     TypeInvalid,
@@ -947,6 +949,276 @@ class ExactSequence(object):
 
     def __repr__(self):
         return 'ExactSequence([%s])' % ", ".join(repr(v) for v in self.validators)
+
+
+class Opt(object):
+    """An optional item of a `SequencePattern`: matches zero or one element.
+
+    :param schema: schema the element must match if it is present.
+
+    >>> from voluptuous import Schema, SequencePattern, Opt
+    >>> validate = Schema(SequencePattern([str, Opt(int)]))
+    >>> validate(['a', 1])
+    ['a', 1]
+    >>> validate(['a'])
+    ['a']
+    """
+
+    def __init__(self, schema: Schemable) -> None:
+        self.schema = schema
+
+    def __repr__(self):
+        return 'Opt(%r)' % (self.schema,)
+
+
+class Repeat(object):
+    """A bounded repetition segment of a `SequencePattern`.
+
+    :param schema: schema that each element of the segment must match.
+    :param min: minimum number of repetitions (inclusive, default 0).
+    :param max: maximum number of repetitions (inclusive), or None for
+        no upper bound.
+
+    >>> from voluptuous import Schema, SequencePattern, Repeat
+    >>> validate = Schema(SequencePattern([str, Repeat(int, min=1, max=2)]))
+    >>> validate(['a', 1, 2])
+    ['a', 1, 2]
+    """
+
+    def __init__(
+        self,
+        schema: Schemable,
+        min: typing.Optional[int] = 0,
+        max: typing.Optional[int] = None,
+    ) -> None:
+        self.schema = schema
+        self.min = min
+        self.max = max
+
+    def __repr__(self):
+        return 'Repeat(%r, min=%r, max=%r)' % (self.schema, self.min, self.max)
+
+
+class SequencePattern(object):
+    """Match a sequence against a pattern of fixed, optional and
+    bounded-repetition segments.
+
+    Each item of the pattern is either a plain schema (a fixed item,
+    matching exactly one element), an `Opt` (zero or one element) or a
+    `Repeat` (between ``min`` and ``max`` elements).
+
+    Segmentation rule (documented longest match): segments are considered
+    left to right, and each variable-width segment (`Opt`, `Repeat`)
+    consumes as many elements as possible while still allowing the rest of
+    the pattern to match. If an element is accepted by both an optional
+    marker and a following repetition, the earlier segment wins. Every
+    pattern is unambiguous under this rule; degenerate declarations
+    (empty pattern, ``Repeat`` with ``min > max``, negative ``min``,
+    ``max < 1``, or nested `Opt`/`Repeat` items) are rejected with
+    `SchemaError` when the pattern is declared.
+
+    Matching and conversion are strictly separated into two phases. During
+    matching, each element is probed against each segment at most once and
+    the results are cached, so validators with side effects are never
+    re-executed for backtracking. The final output is assembled from the
+    cached results without re-running any validator, and errors always
+    carry the original element index, unaffected by internal conversions.
+
+    Input shorter than the pattern minimum or longer than the pattern
+    maximum is rejected before any element is inspected, so empty and
+    over-long input fail fast.
+
+    :param items: the pattern items (schemas, `Opt` and `Repeat`).
+    :param msg: message to deliver to user if validation fails.
+    :param kwargs: all other keyword arguments are passed to the
+        sub-schema constructors.
+
+    >>> from voluptuous import Schema, SequencePattern, Opt, Repeat
+    >>> validate = Schema(SequencePattern(['head', Opt('mark'),
+    ...                                    Repeat(int, min=1, max=3), 'tail']))
+    >>> validate(['head', 'mark', 1, 2, 'tail'])
+    ['head', 'mark', 1, 2, 'tail']
+    >>> validate(['head', 1, 'tail'])
+    ['head', 1, 'tail']
+    >>> validate(('head', 1, 'tail'))
+    ('head', 1, 'tail')
+    """
+
+    def __init__(
+        self,
+        items: typing.Iterable[Schemable],
+        msg: typing.Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        self.items = list(items)
+        if not self.items:
+            raise SchemaError('SequencePattern requires at least one item')
+        self.msg = msg
+        self._schemas = []
+        self._bounds = []  # type: typing.List[typing.Tuple[int, typing.Optional[int]]]
+        for item in self.items:
+            if isinstance(item, Opt):
+                schema, lo, hi = item.schema, 0, 1
+            elif isinstance(item, Repeat):
+                schema, lo, hi = item.schema, item.min, item.max
+                if lo is None or lo < 0:
+                    raise SchemaError('Repeat min must be >= 0')
+                if hi is not None and hi < lo:
+                    raise SchemaError('Repeat max must be >= min')
+                if hi is not None and hi < 1:
+                    raise SchemaError('Repeat max must be >= 1')
+            else:
+                schema, lo, hi = item, 1, 1
+            if isinstance(schema, (Opt, Repeat)):
+                raise SchemaError('Opt and Repeat items cannot be nested')
+            self._schemas.append(Schema(schema, **kwargs))
+            self._bounds.append((lo, hi))
+        self._min_total = sum(lo for lo, _ in self._bounds)
+        self._max_total = (
+            None
+            if any(hi is None for _, hi in self._bounds)
+            else sum(hi for _, hi in self._bounds)
+        )
+
+    def __call__(self, v):
+        if not isinstance(v, (list, tuple)):
+            raise SequencePatternInvalid(self.msg or 'expected a list or tuple')
+        n = len(v)
+        if n < self._min_total:
+            raise SequencePatternInvalid(
+                self.msg
+                or 'expected at least %d element(s), got %d' % (self._min_total, n)
+            )
+        if self._max_total is not None and n > self._max_total:
+            raise SequencePatternInvalid(
+                self.msg
+                or 'expected at most %d element(s), got %d' % (self._max_total, n)
+            )
+
+        schemas = self._schemas
+        bounds = self._bounds
+        m = len(bounds)
+
+        # Phase 1: matching. Each element is probed against each segment at
+        # most once; the result (converted value or error) is cached, so no
+        # validator is ever re-executed.
+        cache = {}  # type: typing.Dict[typing.Tuple[int, int], typing.Tuple[bool, typing.Any]]
+
+        def probe(s: int, i: int) -> typing.Tuple[bool, typing.Any]:
+            key = (s, i)
+            if key not in cache:
+                try:
+                    cache[key] = (True, schemas[s](v[i]))
+                except Invalid as e:
+                    cache[key] = (False, e)
+            return cache[key]
+
+        # first_fail[s][i]: first index >= i whose element does not match
+        # segment s (n if all remaining elements match).
+        first_fail = []
+        for s in range(m):
+            row = [n] * (n + 1)
+            for i in range(n - 1, -1, -1):
+                row[i] = i if not probe(s, i)[0] else row[i + 1]
+            first_fail.append(row)
+
+        # reachable[s][i]: segments s..m-1 can match elements i..n-1.
+        reachable = [bytearray(n + 1) for _ in range(m + 1)]
+        reachable[m][n] = 1
+        for s in range(m - 1, -1, -1):
+            lo, hi = bounds[s]
+            nxt = reachable[s + 1]
+            pref = [0] * (n + 2)
+            for i in range(n + 1):
+                pref[i + 1] = pref[i] + nxt[i]
+            row = reachable[s]
+            ff = first_fail[s]
+            for i in range(n + 1):
+                kmax = min(n - i, ff[i] - i)
+                if hi is not None and hi < kmax:
+                    kmax = hi
+                if kmax < lo:
+                    continue
+                if pref[i + kmax + 1] - pref[i + lo] > 0:
+                    row[i] = 1
+
+        if not reachable[0][0]:
+            self._raise_mismatch(v, cache, first_fail)
+
+        # Greedy longest-match reconstruction: each segment consumes as
+        # many elements as possible while the rest of the pattern can
+        # still match.
+        assignment = []
+        i = 0
+        for s in range(m):
+            lo, hi = bounds[s]
+            kmax = min(n - i, first_fail[s][i] - i)
+            if hi is not None and hi < kmax:
+                kmax = hi
+            k = kmax
+            nxt = reachable[s + 1]
+            while not nxt[i + k]:
+                k -= 1
+            assignment.append((s, i, i + k))
+            i += k
+
+        # Phase 2: conversion. The output is assembled from the cached
+        # phase-1 results; nothing is re-validated, so element indexes in
+        # errors never shift.
+        out = []
+        for s, start, end in assignment:
+            for j in range(start, end):
+                out.append(cache[(s, j)][1])
+        return type(v)(out)
+
+    def _raise_mismatch(self, v, cache, first_fail):
+        """Report the first element that cannot be placed in any segment."""
+        n = len(v)
+        bounds = self._bounds
+        m = len(bounds)
+
+        # Suffix sums of the segment bounds, used to replay the greedy
+        # segmentation and find where it gets stuck.
+        suf_min = [0] * (m + 1)
+        suf_max = [0] * (m + 1)  # None means unbounded
+        for s in range(m - 1, -1, -1):
+            lo, hi = bounds[s]
+            suf_min[s] = suf_min[s + 1] + lo
+            suf_max[s] = (
+                None
+                if suf_max[s + 1] is None or hi is None
+                else suf_max[s + 1] + hi
+            )
+
+        i = 0
+        s = m - 1
+        for s in range(m):
+            lo, hi = bounds[s]
+            run = first_fail[s][i] - i
+            kmax = min(run, n - i - suf_min[s + 1])
+            if hi is not None and hi < kmax:
+                kmax = hi
+            kmin = lo
+            if suf_max[s + 1] is not None:
+                kmin = max(kmin, n - i - suf_max[s + 1])
+            if kmax < kmin:
+                break
+            i += kmax
+
+        e = i + (first_fail[s][i] - i)
+        if e < n:
+            ok, payload = cache[(s, e)]
+            if not ok:
+                if self.msg is not None:
+                    raise SequencePatternInvalid(self.msg, [e])
+                payload.prepend([e])
+                raise payload
+        raise SequencePatternInvalid(
+            self.msg or 'input does not match the sequence pattern', [min(i, n)]
+        )
+
+    def __repr__(self):
+        return 'SequencePattern([%s])' % ", ".join(repr(v) for v in self.items)
 
 
 class Unique(object):

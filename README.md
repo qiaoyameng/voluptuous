@@ -279,6 +279,43 @@ True
 [1, 2]
 ```
 
+### Sequence patterns
+
+`SequencePattern` validates a sequence against a pattern of fixed items,
+optional items (`Opt`) and bounded repetitions (`Repeat`), which is handy
+for decoded binary protocols made of a fixed header, an optional marker,
+a bounded run of records and a fixed tail:
+
+```pycon
+>>> from voluptuous import Schema, SequencePattern, Opt, Repeat
+>>> frame = Schema(SequencePattern([
+...   {'kind': 'head'},
+...   Opt({'kind': 'sync', 'payload': int}),
+...   Repeat({'kind': Any('sync', 'data'), 'payload': int}, min=1, max=4),
+...   {'kind': 'tail'},
+... ]))
+>>> frame([{'kind': 'head'}, {'kind': 'data', 'payload': 1}, {'kind': 'tail'}])
+[{'kind': 'head'}, {'kind': 'data', 'payload': 1}, {'kind': 'tail'}]
+
+```
+
+Segmentation follows a documented longest-match rule: segments are
+considered left to right and each variable-width segment (`Opt`,
+`Repeat`) consumes as many elements as possible while the rest of the
+pattern can still match. If an element is accepted by both an optional
+marker and a following repetition, the earlier segment wins. Degenerate
+declarations (empty pattern, `Repeat` with `min > max`, negative `min`,
+`max < 1`, nested `Opt`/`Repeat`) are rejected with `SchemaError` when
+the pattern is declared.
+
+Matching and conversion are strictly separated: during matching each
+element is probed against each segment at most once and the results are
+cached, so validators with side effects are never re-executed for
+backtracking, and errors always carry the original element index. Input
+shorter than the pattern minimum or longer than the pattern maximum is
+rejected before any element is inspected, so empty and over-long input
+fail fast.
+
 ### Sets and frozensets
 
 Sets and frozensets are treated as a set of valid values. Each element
@@ -843,4 +880,3 @@ using voluptuous validators in `assert`s.
 
 I greatly prefer the light-weight style promoted by these libraries to
 the complexity of libraries like FormEncode.
-

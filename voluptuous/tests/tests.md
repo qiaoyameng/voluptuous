@@ -271,3 +271,72 @@ Ensure that Optional('Classification') < 'Name' will return True instead of thro
 
     >>> Optional('Classification') < 'Name'
     True
+
+Sequence patterns with fixed, optional and bounded-repetition segments
+can be validated with `SequencePattern`, `Opt` and `Repeat`. Consider a
+decoded binary protocol frame: a fixed header, an optional sync marker,
+one to four records and a fixed tail:
+
+    >>> from voluptuous import SequencePattern, Opt, Repeat
+    >>> def tag(label):
+    ...   def apply(d):
+    ...     return (label, d['kind'], d['payload'])
+    ...   return apply
+    ...
+    >>> marker = All({'kind': 'sync', 'payload': int}, tag('marker'))
+    >>> record = All({'kind': Any('sync', 'data'), 'payload': int}, tag('record'))
+    >>> frame = Schema(SequencePattern([
+    ...   {'kind': 'head'},
+    ...   Opt(marker),
+    ...   Repeat(record, min=1, max=4),
+    ...   {'kind': 'tail'},
+    ... ]))
+
+The boundary sample below contains an element that both the optional
+marker and the record rule accept. Segmentation follows the documented
+longest-match rule: segments are considered left to right and each
+variable-width segment consumes as much as possible while the rest of
+the pattern can still match, so the earlier segment (the marker) wins:
+
+    >>> frame([{'kind': 'head'},
+    ...        {'kind': 'sync', 'payload': 1},
+    ...        {'kind': 'data', 'payload': 2},
+    ...        {'kind': 'tail'}])
+    [{'kind': 'head'}, ('marker', 'sync', 1), ('record', 'data', 2), {'kind': 'tail'}]
+
+A missing tail is reported at the element that took its place:
+
+    >>> try:
+    ...   frame([{'kind': 'head'},
+    ...          {'kind': 'data', 'payload': 1},
+    ...          {'kind': 'data', 'payload': 2}])
+    ...   raise AssertionError('MultipleInvalid not raised')
+    ... except MultipleInvalid as e:
+    ...   exc = e
+    >>> str(exc) == "not a valid value for dictionary value @ data[2]['kind']"
+    True
+
+Too few records fails the declared lower bound:
+
+    >>> few = Schema(SequencePattern(['head', Repeat(int, min=2, max=4), 'tail']))
+    >>> try:
+    ...   few(['head', 1, 'tail'])
+    ...   raise AssertionError('MultipleInvalid not raised')
+    ... except MultipleInvalid as e:
+    ...   exc = e
+    >>> str(exc)
+    'expected at least 4 element(s), got 3'
+
+An inner field failure keeps the original element index, so later
+errors are never shifted by internal conversions:
+
+    >>> try:
+    ...   frame([{'kind': 'head'},
+    ...          {'kind': 'data', 'payload': 1},
+    ...          {'kind': 'data', 'payload': 'x'},
+    ...          {'kind': 'tail'}])
+    ...   raise AssertionError('MultipleInvalid not raised')
+    ... except MultipleInvalid as e:
+    ...   exc = e
+    >>> str(exc) == "expected int for dictionary value @ data[2]['payload']"
+    True

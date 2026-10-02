@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+**New**:
+
+* Add `SequencePattern`, `Opt` and `Repeat` validators for sequences made of fixed items, optional items and bounded-repetition segments, with a documented longest-match segmentation rule
+
 **Fixes**:
 
 * [#539](https://github.com/alecthomas/voluptuous/pull/539): Raise `Invalid` instead of leaking `TypeError`/`ValueError` for non-numeric input to the `Number` validator
