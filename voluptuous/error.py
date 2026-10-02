@@ -194,6 +194,33 @@ class DatetimeInvalid(Invalid):
     """The value is not a formatted datetime string."""
 
 
+class DisjointIntervalsInvalid(Invalid):
+    """The interval is malformed or overlaps another interval."""
+
+    def __init__(
+        self,
+        message: str,
+        path: typing.Optional[typing.List[typing.Hashable]] = None,
+        indices: typing.Optional[typing.Tuple[int, int]] = None,
+        field_paths: typing.Optional[
+            typing.Tuple[
+                typing.List[typing.Hashable], typing.List[typing.Hashable]
+            ]
+        ] = None,
+    ) -> None:
+        super().__init__(message, path)
+        self.indices = indices
+        self.field_paths = field_paths
+
+    def prepend(self, path: typing.List[typing.Hashable]) -> None:
+        super().prepend(path)
+        if self.field_paths is not None:
+            self.field_paths = (
+                path + self.field_paths[0],
+                path + self.field_paths[1],
+            )
+
+
 class DateInvalid(Invalid):
     """The value is not a formatted date string."""
 

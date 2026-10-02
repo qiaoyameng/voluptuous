@@ -1,6 +1,7 @@
 # fmt: off
 import collections
 import copy
+import datetime as dt
 import os
 from enum import Enum
 
@@ -19,6 +20,8 @@ from voluptuous import (
     ContainsInvalid,
     Date,
     Datetime,
+    DisjointIntervals,
+    DisjointIntervalsInvalid,
     Email,
     EmailInvalid,
     Equal,
@@ -1270,6 +1273,276 @@ def test_date_custom_format():
     schema = Schema({"date": Date("%Y%m%d")})
     schema({"date": "20161024"})
     pytest.raises(MultipleInvalid, schema, {"date": "2016-10-24"})
+
+
+def test_disjoint_intervals_cleans_endpoints_with_item_schema():
+    schema = Schema(
+        DisjointIntervals(
+            {
+                'resource': str,
+                'start': All(Coerce(int)),
+                'end': All(Coerce(int)),
+            },
+            group_by='resource',
+        )
+    )
+
+    result = schema(
+        [
+            {'resource': 'a', 'start': '1', 'end': '2'},
+            {'resource': 'a', 'start': '2', 'end': '3'},
+        ]
+    )
+
+    assert result == [
+        {'resource': 'a', 'start': 1, 'end': 2},
+        {'resource': 'a', 'start': 2, 'end': 3},
+    ]
+
+
+def test_disjoint_intervals_supports_schema_keyword_and_nested_field_paths():
+    validator = DisjointIntervals(
+        schema={
+            'resource': str,
+            'period': {'from': int, 'to': int},
+        },
+        start=('period', 'from'),
+        end=('period', 'to'),
+        group_by='resource',
+    )
+
+    with pytest.raises(MultipleInvalid) as exc_info:
+        Schema(validator)(
+            [
+                {
+                    'resource': 'a',
+                    'period': {'from': 0, 'to': 3},
+                },
+                {
+                    'resource': 'a',
+                    'period': {'from': 2, 'to': 4},
+                },
+            ]
+        )
+
+    error = exc_info.value.errors[0]
+    assert error.indices == (0, 1)
+    assert error.path == [0, 'period', 'from']
+
+
+def test_disjoint_intervals_half_open_and_closed_endpoint_touching():
+    item_schema = {'resource': str, 'start': int, 'end': int}
+    intervals = [
+        {'resource': 'a', 'start': 1, 'end': 2},
+        {'resource': 'a', 'start': 2, 'end': 3},
+    ]
+
+    half_open = Schema(
+        DisjointIntervals(item_schema, group_by='resource', inclusive=(True, False))
+    )
+    assert half_open(copy.deepcopy(intervals))
+
+    closed = Schema(
+        DisjointIntervals(item_schema, group_by='resource', inclusive=(True, True))
+    )
+    with pytest.raises(MultipleInvalid) as exc_info:
+        closed(copy.deepcopy(intervals))
+    error = exc_info.value.errors[0]
+    assert error.indices == (0, 1)
+    assert error.field_paths == ([0, 'start'], [1, 'start'])
+
+
+def test_disjoint_intervals_nested_overlap_and_group_isolation():
+    schema = Schema(
+        DisjointIntervals(
+            {'resource': str, 'start': int, 'end': int}, group_by='resource'
+        )
+    )
+
+    assert schema(
+        [
+            {'resource': 'a', 'start': 0, 'end': 10},
+            {'resource': 'b', 'start': 2, 'end': 8},
+        ]
+    )
+
+    with pytest.raises(MultipleInvalid) as exc_info:
+        schema(
+            [
+                {'resource': 'a', 'start': 0, 'end': 10},
+                {'resource': 'a', 'start': 2, 'end': 8},
+            ]
+        )
+    assert exc_info.value.errors[0].indices == (0, 1)
+    assert exc_info.value.errors[0].path == [0, 'start']
+
+
+def test_disjoint_intervals_shuffled_input_keeps_original_indices_and_order():
+    schema = Schema(
+        DisjointIntervals(
+            {'resource': str, 'start': int, 'end': int}, group_by='resource'
+        )
+    )
+    intervals = [
+        {'resource': 'a', 'start': 5, 'end': 6},
+        {'resource': 'a', 'start': 0, 'end': 10},
+        {'resource': 'a', 'start': 9, 'end': 11},
+    ]
+    original = copy.deepcopy(intervals)
+
+    with pytest.raises(MultipleInvalid) as exc_info:
+        schema(intervals)
+
+    assert [error.indices for error in exc_info.value.errors] == [(0, 1), (1, 2)]
+    assert [error.path for error in exc_info.value.errors] == [
+        [0, 'start'],
+        [1, 'start'],
+    ]
+    assert intervals == original
+
+
+def test_disjoint_intervals_empty_and_singleton_rules():
+    item_schema = {'start': int, 'end': int}
+
+    with pytest.raises(MultipleInvalid):
+        Schema(DisjointIntervals(item_schema))([{'start': 1, 'end': 1}])
+
+    schema = Schema(DisjointIntervals(item_schema, allow_empty=True))
+    assert schema([{'start': 1, 'end': 1}])
+
+    closed_singleton = Schema(DisjointIntervals(item_schema, inclusive=(True, True)))
+    with pytest.raises(MultipleInvalid) as exc_info:
+        closed_singleton([{'start': 1, 'end': 1}, {'start': 1, 'end': 1}])
+    assert exc_info.value.errors[0].indices == (0, 1)
+
+
+def test_disjoint_intervals_unbounded_and_nullable_fields_are_distinct():
+    item_schema = {
+        'resource': str,
+        'start': Maybe(dt.datetime),
+        'end': Maybe(dt.datetime),
+    }
+    schema = Schema(
+        DisjointIntervals(item_schema, group_by='resource', allow_unbounded=True)
+    )
+
+    with pytest.raises(MultipleInvalid) as exc_info:
+        schema(
+            [
+                {
+                    'resource': 'a',
+                    'start': None,
+                    'end': dt.datetime(2024, 1, 2),
+                },
+                {
+                    'resource': 'a',
+                    'start': dt.datetime(2024, 1, 1),
+                    'end': None,
+                },
+            ]
+        )
+    assert exc_info.value.errors[0].indices == (0, 1)
+
+    nullable_schema = Schema(
+        DisjointIntervals(item_schema, nullable=True, unbounded_value=object())
+    )
+    assert nullable_schema(
+        [
+            {'resource': 'a', 'start': None, 'end': None},
+            {
+                'resource': 'a',
+                'start': dt.datetime(2024, 1, 1),
+                'end': dt.datetime(2024, 1, 2),
+            },
+        ]
+    )
+
+
+def test_disjoint_intervals_rejects_mixed_naive_and_aware_datetimes():
+    schema = Schema(DisjointIntervals({'start': dt.datetime, 'end': dt.datetime}))
+
+    with pytest.raises(MultipleInvalid) as exc_info:
+        schema(
+            [
+                {
+                    'start': dt.datetime(2024, 1, 1),
+                    'end': dt.datetime(2024, 1, 2),
+                },
+                {
+                    'start': dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc),
+                    'end': dt.datetime(2024, 1, 3, tzinfo=dt.timezone.utc),
+                },
+            ]
+        )
+
+    assert 'naive and timezone-aware' in exc_info.value.errors[0].msg
+
+
+def test_disjoint_intervals_rejects_mixed_datetime_kinds_across_groups():
+    schema = Schema(
+        DisjointIntervals(
+            {'resource': str, 'start': dt.datetime, 'end': dt.datetime},
+            group_by='resource',
+        )
+    )
+
+    with pytest.raises(MultipleInvalid) as exc_info:
+        schema(
+            [
+                {
+                    'resource': 'a',
+                    'start': dt.datetime(2024, 1, 1),
+                    'end': dt.datetime(2024, 1, 2),
+                },
+                {
+                    'resource': 'b',
+                    'start': dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc),
+                    'end': dt.datetime(2024, 1, 3, tzinfo=dt.timezone.utc),
+                },
+            ]
+        )
+
+    assert 'naive and timezone-aware' in exc_info.value.errors[0].msg
+
+
+def test_disjoint_intervals_rejects_incomparable_endpoint_types():
+    schema = Schema(DisjointIntervals({'start': object, 'end': object}))
+
+    with pytest.raises(MultipleInvalid) as exc_info:
+        schema([{'start': object(), 'end': object()}])
+
+    assert exc_info.value.errors[0].path == [0, 'end']
+
+
+def test_disjoint_intervals_normalize_aware_datetime_offsets():
+    schema = Schema(
+        DisjointIntervals(
+            {'start': dt.datetime, 'end': dt.datetime}, inclusive=(True, False)
+        )
+    )
+    plus_one = dt.timezone(dt.timedelta(hours=1))
+
+    assert schema(
+        [
+            {
+                'start': dt.datetime(2024, 1, 1, 0, tzinfo=dt.timezone.utc),
+                'end': dt.datetime(2024, 1, 1, 1, tzinfo=dt.timezone.utc),
+            },
+            {
+                'start': dt.datetime(2024, 1, 1, 2, tzinfo=plus_one),
+                'end': dt.datetime(2024, 1, 1, 3, tzinfo=plus_one),
+            },
+        ]
+    )
+
+
+def test_disjoint_intervals_rejects_start_after_end():
+    schema = Schema(DisjointIntervals({'start': int, 'end': int}))
+
+    with pytest.raises(MultipleInvalid) as exc_info:
+        schema([{'start': 2, 'end': 1}])
+
+    assert exc_info.value.errors[0].path == [0, 'end']
 
 
 def test_ordered_dict():

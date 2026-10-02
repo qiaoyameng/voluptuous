@@ -1,6 +1,7 @@
 # fmt: off
 from __future__ import annotations
 
+import collections.abc
 import datetime
 import os
 import re
@@ -17,6 +18,7 @@ from voluptuous.error import (
     ContainsInvalid,
     DateInvalid,
     DatetimeInvalid,
+    DisjointIntervalsInvalid,
     DirInvalid,
     EmailInvalid,
     ExactSequenceInvalid,
@@ -31,6 +33,7 @@ from voluptuous.error import (
     NotInInvalid,
     PathInvalid,
     RangeInvalid,
+    SchemaError,
     TooManyValid,
     TrueInvalid,
     TypeInvalid,
@@ -38,7 +41,12 @@ from voluptuous.error import (
 )
 
 # F401: flake8 complains about 'raises' not being used, but it is used in doctests
-from voluptuous.schema_builder import Schema, Schemable, message, raises  # noqa: F401
+from voluptuous.schema_builder import (
+    Schema,
+    Schemable,
+    message,
+    raises,
+)  # noqa: F401
 
 if typing.TYPE_CHECKING:
     from _typeshed import SupportsAllComparisons
@@ -991,6 +999,483 @@ class Unique(object):
 
     def __repr__(self):
         return 'Unique()'
+
+
+class DisjointIntervals(_WithSubValidators):
+    """Ensure grouped intervals do not overlap.
+
+    Endpoint values are first passed through the supplied item schema, so
+    coercions in that schema are applied before intervals are compared. The
+    input sequence is never sorted in place.
+
+    Timezone-aware datetimes are converted to UTC before comparison. Mixing
+    aware and naive datetimes in a group is rejected without consulting the
+    local timezone.
+    """
+
+    _MISSING = object()
+
+    def __init__(
+        self,
+        *validators: Schemable,
+        schema: typing.Optional[Schemable] = None,
+        item_schema: typing.Optional[Schemable] = None,
+        start: typing.Hashable | typing.Sequence[typing.Hashable] = 'start',
+        end: typing.Hashable | typing.Sequence[typing.Hashable] = 'end',
+        group_by: typing.Union[
+            None,
+            str,
+            typing.Sequence[typing.Hashable],
+            typing.Callable[[typing.Any], typing.Hashable],
+        ] = None,
+        start_inclusive: typing.Optional[bool] = None,
+        end_inclusive: typing.Optional[bool] = None,
+        inclusive: typing.Optional[typing.Union[str, typing.Tuple[bool, bool]]] = None,
+        bounds: typing.Optional[typing.Union[str, typing.Tuple[bool, bool]]] = None,
+        allow_empty: bool = False,
+        nullable: bool = False,
+        allow_unbounded: bool = False,
+        unbounded_value: typing.Any = None,
+        missing_endpoint_unbounded: bool = False,
+        msg: typing.Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        if schema is not None:
+            validators += (schema,)
+        if item_schema is not None:
+            validators += (item_schema,)
+
+        start_inclusive = kwargs.pop('start_included', start_inclusive)
+        end_inclusive = kwargs.pop('end_included', end_inclusive)
+        start_inclusive = kwargs.pop('left_inclusive', start_inclusive)
+        end_inclusive = kwargs.pop('right_inclusive', end_inclusive)
+        start_inclusive = kwargs.pop('lower_inclusive', start_inclusive)
+        end_inclusive = kwargs.pop('upper_inclusive', end_inclusive)
+        start = kwargs.pop('start_field', start)
+        end = kwargs.pop('end_field', end)
+        start = kwargs.pop('start_key', start)
+        end = kwargs.pop('end_key', end)
+        group_by = kwargs.pop('group', group_by)
+        group_by = kwargs.pop('group_field', group_by)
+        inclusive = inclusive if inclusive is not None else bounds
+
+        if isinstance(inclusive, str):
+            inclusive_values = {
+                '[]': (True, True),
+                '[)': (True, False),
+                '(]': (False, True),
+                '()': (False, False),
+            }
+            if inclusive not in inclusive_values:
+                raise SchemaError("bounds must be one of '[]', '[)', '(]', '()'")
+            inclusive = inclusive_values[inclusive]
+
+        if inclusive is not None:
+            if start_inclusive is not None or end_inclusive is not None:
+                raise SchemaError(
+                    'inclusive cannot be combined with start/end inclusion options'
+                )
+            start_inclusive, end_inclusive = inclusive
+
+        self.start_path = self._field_path(start)
+        self.end_path = self._field_path(end)
+        self.group_by = group_by
+        self.start_inclusive = True if start_inclusive is None else start_inclusive
+        self.end_inclusive = False if end_inclusive is None else end_inclusive
+        self.allow_empty = allow_empty
+        self.nullable = nullable
+        self.allow_unbounded = allow_unbounded
+        self.unbounded_value = unbounded_value
+        self.missing_endpoint_unbounded = missing_endpoint_unbounded
+
+        if self.nullable and self.allow_unbounded and self.unbounded_value is None:
+            raise SchemaError(
+                'nullable and unbounded endpoints cannot both use None; set a '
+                'distinct unbounded_value'
+            )
+
+        super().__init__(*validators, msg=msg, **kwargs)
+
+    def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
+        self._compiled = []
+        old_required = schema.required
+        self.schema = schema
+        for validator in self.validators:
+            schema.required = self.required
+            self._compiled.append(schema._compile([validator]))
+        schema.required = old_required
+        return self._run
+
+    def __call__(self, value):
+        return self._exec(
+            (Schema([validator]) for validator in self.validators), value
+        )
+
+    @staticmethod
+    def _field_path(
+        value: typing.Hashable | typing.Sequence[typing.Hashable],
+    ) -> typing.Tuple[typing.Hashable, ...]:
+        if isinstance(value, (list, tuple)):
+            return tuple(value)
+        return (value,)
+
+    @staticmethod
+    def _get_value(
+        record: typing.Any, path: typing.Tuple[typing.Hashable, ...]
+    ) -> typing.Any:
+        current = record
+        for part in path:
+            if isinstance(current, collections.abc.Mapping):
+                try:
+                    current = current[part]
+                except KeyError:
+                    return DisjointIntervals._MISSING
+            else:
+                try:
+                    current = getattr(current, str(part))
+                except AttributeError:
+                    return DisjointIntervals._MISSING
+        return current
+
+    def _group_paths(self):
+        if self.group_by is None:
+            return []
+        if callable(self.group_by) or isinstance(self.group_by, str):
+            return [self._field_path(self.group_by)]
+        return [self._field_path(field) for field in self.group_by]
+
+    def _group_key(
+        self, record: typing.Any
+    ) -> typing.Union[typing.Hashable, object]:
+        if self.group_by is None:
+            return None
+        if callable(self.group_by):
+            return self.group_by(record)
+
+        paths = self._group_paths()
+        values = [self._get_value(record, path) for path in paths]
+        if any(value is self._MISSING for value in values):
+            return self._MISSING
+        return values[0] if len(values) == 1 else tuple(values)
+
+    def _endpoint_error(
+        self,
+        message: str,
+        path: typing.List[typing.Hashable],
+        index: int,
+        endpoint_path: typing.Tuple[typing.Hashable, ...],
+    ) -> DisjointIntervalsInvalid:
+        field_path = path + [index, *endpoint_path]
+        return DisjointIntervalsInvalid(
+            self.msg or message,
+            field_path,
+            field_paths=(field_path, field_path),
+        )
+
+    def _conflict_error(
+        self,
+        path: typing.List[typing.Hashable],
+        first: int,
+        second: int,
+    ) -> DisjointIntervalsInvalid:
+        first, second = sorted((first, second))
+        first_path = path + [first, *self.start_path]
+        second_path = path + [second, *self.start_path]
+        return DisjointIntervalsInvalid(
+            self.msg
+            or 'intervals at records %s and %s overlap' % (first, second),
+            first_path,
+            indices=(first, second),
+            field_paths=(first_path, second_path),
+        )
+
+    @staticmethod
+    def _datetime_kind(value: typing.Any) -> typing.Optional[str]:
+        if isinstance(value, datetime.datetime):
+            return 'aware' if value.tzinfo is not None else 'naive'
+        return None
+
+    @staticmethod
+    def _instant(value: typing.Any) -> typing.Any:
+        if isinstance(value, datetime.datetime) and value.tzinfo is not None:
+            return value.astimezone(datetime.timezone.utc)
+        return value
+
+    def _interval(
+        self,
+        record: typing.Any,
+        index: int,
+        path: typing.List[typing.Hashable],
+    ) -> typing.Optional[typing.Dict[str, typing.Any]]:
+        if record is None:
+            if self.nullable:
+                return None
+            raise self._endpoint_error(
+                'interval record must not be null', path, index, self.start_path
+            )
+
+        raw_start = self._get_value(record, self.start_path)
+        raw_end = self._get_value(record, self.end_path)
+
+        if raw_start is self._MISSING and self.missing_endpoint_unbounded:
+            raw_start = self.unbounded_value
+        if raw_end is self._MISSING and self.missing_endpoint_unbounded:
+            raw_end = self.unbounded_value
+
+        if raw_start is self._MISSING:
+            raise self._endpoint_error(
+                'interval start is required', path, index, self.start_path
+            )
+        if raw_end is self._MISSING:
+            raise self._endpoint_error(
+                'interval end is required', path, index, self.end_path
+            )
+
+        if self.nullable and (raw_start is None or raw_end is None):
+            return None
+        if not self.allow_unbounded and (
+            raw_start is self.unbounded_value or raw_end is self.unbounded_value
+        ):
+            endpoint_path = (
+                self.start_path
+                if raw_start is self.unbounded_value
+                else self.end_path
+            )
+            raise self._endpoint_error(
+                'unbounded interval endpoints are not allowed',
+                path,
+                index,
+                endpoint_path,
+            )
+
+        start_unbounded = self.allow_unbounded and raw_start is self.unbounded_value
+        end_unbounded = self.allow_unbounded and raw_end is self.unbounded_value
+
+        try:
+            start = None if start_unbounded else self._instant(raw_start)
+            end = None if end_unbounded else self._instant(raw_end)
+        except (TypeError, ValueError, OverflowError):
+            raise self._endpoint_error(
+                'interval endpoint is not a comparable instant',
+                path,
+                index,
+                self.start_path,
+            )
+
+        if start is not None and end is not None:
+            start_kind = self._datetime_kind(raw_start)
+            end_kind = self._datetime_kind(raw_end)
+            if start_kind is not None and start_kind != end_kind:
+                raise self._endpoint_error(
+                    'naive and timezone-aware datetimes cannot be combined',
+                    path,
+                    index,
+                    self.end_path,
+                )
+            try:
+                if start > end:
+                    raise self._endpoint_error(
+                        'interval start must not be after end',
+                        path,
+                        index,
+                        self.end_path,
+                    )
+                if start == end and not (
+                    self.start_inclusive and self.end_inclusive
+                ):
+                    if self.allow_empty:
+                        return None
+                    raise self._endpoint_error(
+                        'empty intervals are not allowed',
+                        path,
+                        index,
+                        self.start_path,
+                    )
+            except TypeError:
+                raise self._endpoint_error(
+                    'interval endpoints are not comparable',
+                    path,
+                    index,
+                    self.end_path,
+                )
+
+        return {
+            'index': index,
+            'start': start,
+            'end': end,
+            'datetime_kind': self._datetime_kind(raw_start)
+            or self._datetime_kind(raw_end),
+        }
+
+    def _intervals(
+        self,
+        records: typing.List[typing.Any],
+        indices: typing.List[int],
+        path: typing.List[typing.Hashable],
+    ) -> typing.Tuple[
+        typing.List[typing.Dict[str, typing.Any]],
+        typing.List[DisjointIntervalsInvalid],
+    ]:
+        intervals = []
+        errors = []
+
+        for record, index in zip(records, indices):
+            try:
+                interval = self._interval(record, index, path)
+            except DisjointIntervalsInvalid as error:
+                errors.append(error)
+                continue
+            if interval is None:
+                continue
+            intervals.append(interval)
+
+        return intervals, errors
+
+    def _scan_intervals(
+        self,
+        intervals: typing.List[typing.Dict[str, typing.Any]],
+        path: typing.List[typing.Hashable],
+    ) -> typing.List[DisjointIntervalsInvalid]:
+        events = []
+        active = set()
+        conflicts = []
+
+        for interval in intervals:
+            index = interval['index']
+            if interval['start'] is None:
+                for other in active:
+                    conflicts.append(self._conflict_error(path, index, other))
+                active.add(index)
+            else:
+                phase = 1 if self.start_inclusive else 3
+                events.append((self._instant(interval['start']), phase, index))
+
+            if interval['end'] is not None:
+                phase = 0 if not self.end_inclusive else 2
+                events.append((self._instant(interval['end']), phase, index))
+
+        try:
+            ordered_events = sorted(events, key=lambda event: event[:2])
+        except TypeError:
+            first_index = min(interval['index'] for interval in intervals)
+            raise DisjointIntervalsInvalid(
+                self.msg or 'interval endpoints are not comparable',
+                path + [first_index, *self.start_path],
+            )
+
+        for _, phase, index in ordered_events:
+            if phase in (0, 2):
+                active.discard(index)
+                continue
+
+            for other in active:
+                conflicts.append(self._conflict_error(path, index, other))
+            active.add(index)
+
+        return conflicts
+
+    def _validate(
+        self,
+        value: typing.Union[list, tuple],
+        path: typing.Optional[typing.List[typing.Hashable]] = None,
+    ) -> typing.Union[list, tuple]:
+        path = path or []
+        if not isinstance(value, (list, tuple)):
+            raise DisjointIntervalsInvalid(
+                self.msg or 'expected a sequence of intervals', path
+            )
+
+        groups: typing.Dict[typing.Hashable, typing.Dict[str, list]] = {}
+        group_paths = self._group_paths()
+        for index, record in enumerate(value):
+            try:
+                key = self._group_key(record)
+                hash(key)
+            except TypeError:
+                raise DisjointIntervalsInvalid(
+                    self.msg or 'interval group key must be hashable',
+                    path + [index],
+                )
+            if key is self._MISSING:
+                missing_path = next(
+                    group_path
+                    for group_path in group_paths
+                    if self._get_value(record, group_path) is self._MISSING
+                )
+                raise DisjointIntervalsInvalid(
+                    self.msg or 'interval group field is required',
+                    path + [index, *missing_path],
+                )
+            group = groups.setdefault(key, {'records': [], 'indices': []})
+            group['records'].append(record)
+            group['indices'].append(index)
+
+        errors = []
+        grouped_intervals = []
+        for group in groups.values():
+            intervals, group_errors = self._intervals(
+                group['records'], group['indices'], path
+            )
+            errors.extend(group_errors)
+            grouped_intervals.append(intervals)
+
+        all_intervals = [
+            interval
+            for intervals in grouped_intervals
+            for interval in intervals
+        ]
+
+        has_naive = any(
+            interval['datetime_kind'] == 'naive' for interval in all_intervals
+        )
+        has_aware = any(
+            interval['datetime_kind'] == 'aware' for interval in all_intervals
+        )
+        if not errors and has_naive and has_aware:
+            errors.append(
+                DisjointIntervalsInvalid(
+                    self.msg
+                    or 'naive and timezone-aware datetimes cannot be compared',
+                    path,
+                )
+            )
+        else:
+            for intervals in grouped_intervals:
+                errors.extend(self._scan_intervals(intervals, path))
+
+        if errors:
+            errors.sort(
+                key=lambda error: (
+                    error.indices if error.indices is not None else (-1, -1),
+                    error.path,
+                )
+            )
+            raise MultipleInvalid(errors)
+        return value
+
+    def _exec(
+        self,
+        funcs: typing.Iterable[typing.Callable],
+        value,
+        path: typing.Optional[typing.List[typing.Hashable]] = None,
+    ):
+        for func in funcs:
+            value = func(value) if path is None else func(path, value)
+        return self._validate(value, path)
+
+    def __repr__(self):
+        return (
+            'DisjointIntervals(%s, start=%r, end=%r, group_by=%r, '
+            'start_inclusive=%r, end_inclusive=%r)'
+            % (
+                ', '.join(repr(validator) for validator in self.validators),
+                self.start_path,
+                self.end_path,
+                self.group_by,
+                self.start_inclusive,
+                self.end_inclusive,
+            )
+        )
 
 
 class Equal(object):

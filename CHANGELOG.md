@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+**New**:
+
+* Add `DisjointIntervals` validator for grouped, endpoint-aware overlap checks
+
 **Fixes**:
 
 * [#539](https://github.com/alecthomas/voluptuous/pull/539): Raise `Invalid` instead of leaking `TypeError`/`ValueError` for non-numeric input to the `Number` validator
