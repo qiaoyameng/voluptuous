@@ -60,6 +60,8 @@ from voluptuous import (
     Unordered,
     Url,
     UrlInvalid,
+    Deprecated,
+    Warning,
     raises,
     validate,
 )
@@ -244,6 +246,176 @@ def test_remove_with_error():
     )
     out_ = schema({".remove": None, "ok": None})
     assert ".remove" not in out_ and "ok" in out_
+
+
+class _WarnThenFail:
+    def __voluptuous_compile__(self, schema):
+        def validate(path, value):
+            from voluptuous.schema_builder import diagnostic_warning
+
+            diagnostic_warning(
+                'failed candidate warning',
+                path,
+                code='failed-candidate',
+            )
+            raise Invalid('candidate failed')
+
+        return validate
+
+
+def test_schema_diagnostics_return_data_and_ordered_diagnostics():
+    schema = Schema(
+        {
+            Required('name'): All(str, Warning(str, 'name is accepted', 'name')),
+            Deprecated('old_name'): str,
+        }
+    )
+
+    result = schema.validate_with_diagnostics(
+        {'name': 'current', 'old_name': 'legacy'}
+    )
+
+    assert result.data == {'name': 'current', 'old_name': 'legacy'}
+    assert result.valid is True
+    assert result.warnings is result.diagnostics
+    assert [diagnostic.path for diagnostic in result.diagnostics] == [
+        ('name',),
+        ('old_name',),
+    ]
+    assert [diagnostic.code for diagnostic in result.diagnostics] == [
+        'name',
+        'deprecated',
+    ]
+
+
+def test_schema_diagnostics_invalid_still_blocks():
+    schema = Schema({Deprecated('old_name'): str, Required('name'): str})
+
+    with raises(MultipleInvalid):
+        schema.validate_with_diagnostics({'old_name': 1})
+
+
+def test_any_discards_warnings_from_failed_candidate():
+    schema = Schema(
+        {
+            'config': Any(
+                _WarnThenFail(),
+                {'format': Any(Deprecated('old'), 'new')},
+            )
+        }
+    )
+
+    current = schema.validate_with_diagnostics({'config': {'format': 'new'}})
+    legacy = schema.validate_with_diagnostics({'config': {'format': 'old'}})
+    current_data, current_warnings = schema.validate_with_warnings(
+        {'config': {'format': 'new'}}
+    )
+    legacy_data, legacy_warnings = schema.validate_with_warnings(
+        {'config': {'format': 'old'}}
+    )
+
+    assert current.data == {'config': {'format': 'new'}}
+    assert current.diagnostics == ()
+    assert current_data == {'config': {'format': 'new'}}
+    assert current_warnings == ()
+    assert legacy.data == {'config': {'format': 'old'}}
+    assert legacy_data == {'config': {'format': 'old'}}
+    assert {diagnostic.code for diagnostic in legacy.diagnostics} == {
+        'deprecated'
+    }
+    assert legacy.diagnostics[0].path == ('config', 'format')
+    assert set(current_warnings) != set(legacy_warnings)
+
+
+def test_all_failure_discards_diagnostics():
+    class _WarnForNonInt:
+        def __voluptuous_compile__(self, schema):
+            def validate(path, value):
+                if not isinstance(value, int):
+                    from voluptuous.schema_builder import diagnostic_warning
+
+                    diagnostic_warning(
+                        'failed stage warning',
+                        path,
+                        code='failed-stage',
+                    )
+                return value
+
+            return validate
+
+    schema = Schema(All(_WarnForNonInt(), int))
+
+    with raises(MultipleInvalid):
+        schema.validate_with_diagnostics('bad')
+    assert schema.validate_with_diagnostics(1).diagnostics == ()
+
+
+def test_diagnostics_apply_to_nested_object_path():
+    class Structure:
+        def __init__(self, name=None, old_name=None):
+            self.name = name
+            self.old_name = old_name
+
+    schema = Schema(Object({Required('name'): str, Deprecated('old_name'): str}))
+    result = schema.diagnose(Structure(name='current', old_name='legacy'))
+
+    assert isinstance(result.data, Structure)
+    assert result.data.name == 'current'
+    assert result.data.old_name == 'legacy'
+    assert result.diagnostics[0].path == ('old_name',)
+
+
+def test_remove_diagnostics_use_original_path():
+    removed_schema = Schema(
+        {'keep': int, Remove(Deprecated('old_name')): str}
+    )
+    removed = removed_schema.validate_with_diagnostics(
+        {'keep': 1, 'old_name': 'legacy'}
+    )
+
+    assert removed.data == {'keep': 1}
+    assert removed.diagnostics[0].path == ('old_name',)
+
+    sequence_schema = Schema([Remove(Warning(1, 'one was removed', 'removed')), int])
+    sequence = sequence_schema.validate_with_diagnostics([1, 2])
+
+    assert sequence.data == [2]
+    assert sequence.diagnostics[0].path == (0,)
+
+    failed_remove_schema = Schema(
+        {Remove(Warning(str, 'remove candidate', 'remove')): int, str: str}
+    )
+    failed_remove = failed_remove_schema.validate_with_diagnostics({'name': 'kept'})
+
+    assert failed_remove.data == {'name': 'kept'}
+    assert failed_remove.diagnostics == ()
+
+
+def test_schema_diagnostics_are_isolated_between_concurrent_calls():
+    from concurrent.futures import ThreadPoolExecutor
+
+    schema = Schema(
+        {'config': Any(_WarnThenFail(), {'format': Any(Deprecated('old'), 'new')})}
+    )
+
+    def validate(use_legacy):
+        if use_legacy:
+            return schema.validate_with_diagnostics({'config': {'format': 'old'}})
+        return schema.validate_with_diagnostics({'config': {'format': 'new'}})
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(validate, [i % 2 for i in range(100)]))
+
+    assert all(
+        result.diagnostics == ()
+        for result, use_legacy in zip(results, [i % 2 for i in range(100)])
+        if not use_legacy
+    )
+    assert all(
+        [diagnostic.code for diagnostic in result.diagnostics] == ['deprecated']
+        for result, use_legacy in zip(results, [i % 2 for i in range(100)])
+        if use_legacy
+    )
 
 
 def test_extra_empty_errors():

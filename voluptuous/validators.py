@@ -38,7 +38,15 @@ from voluptuous.error import (
 )
 
 # F401: flake8 complains about 'raises' not being used, but it is used in doctests
-from voluptuous.schema_builder import Schema, Schemable, message, raises  # noqa: F401
+from voluptuous.schema_builder import (  # noqa: F401
+    Schema,
+    Schemable,
+    _diagnostic_branch,
+    _diagnostic_checkpoint,
+    _rollback_diagnostics,
+    message,
+    raises,
+)
 
 if typing.TYPE_CHECKING:
     from _typeshed import SupportsAllComparisons
@@ -315,14 +323,21 @@ class Any(_WithSubValidators):
     def _exec(self, funcs, v, path=None):
         error = None
         for func in funcs:
+            checkpoint = _diagnostic_checkpoint()
+            selected = False
             try:
                 if path is None:
-                    return func(v)
+                    result = func(v)
                 else:
-                    return func(path, v)
+                    result = func(path, v)
+                selected = True
+                return result
             except Invalid as e:
                 if error is None or len(e.path) > len(error.path):
                     error = e
+            finally:
+                if not selected:
+                    _rollback_diagnostics(checkpoint)
         else:
             if error:
                 raise error if self.msg is None else AnyInvalid(self.msg, path=path)
@@ -357,14 +372,21 @@ class Union(_WithSubValidators):
     def _exec(self, funcs, v, path=None):
         error = None
         for func in funcs:
+            checkpoint = _diagnostic_checkpoint()
+            selected = False
             try:
                 if path is None:
-                    return func(v)
+                    result = func(v)
                 else:
-                    return func(path, v)
+                    result = func(path, v)
+                selected = True
+                return result
             except Invalid as e:
                 if error is None or len(e.path) > len(error.path):
                     error = e
+            finally:
+                if not selected:
+                    _rollback_diagnostics(checkpoint)
         else:
             if error:
                 raise error if self.msg is None else AnyInvalid(self.msg, path=path)
@@ -389,14 +411,15 @@ class All(_WithSubValidators):
     """
 
     def _exec(self, funcs, v, path=None):
-        try:
-            for func in funcs:
-                if path is None:
-                    v = func(v)
-                else:
-                    v = func(path, v)
-        except Invalid as e:
-            raise e if self.msg is None else AllInvalid(self.msg, path=path)
+        with _diagnostic_branch():
+            try:
+                for func in funcs:
+                    if path is None:
+                        v = func(v)
+                    else:
+                        v = func(path, v)
+            except Invalid as e:
+                raise e if self.msg is None else AllInvalid(self.msg, path=path)
         return v
 
 

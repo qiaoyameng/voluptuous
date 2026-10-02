@@ -9,6 +9,7 @@ import re
 import typing
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cache, wraps
 
 from voluptuous import error as er
@@ -35,6 +36,78 @@ class Undefined(object):
 
 
 UNDEFINED = Undefined()
+
+
+class Diagnostic(typing.NamedTuple):
+    """A non-blocking validation diagnostic."""
+
+    message: str
+    path: typing.Tuple[typing.Hashable, ...]
+    code: typing.Optional[str] = None
+    validator: typing.Any = None
+
+
+class ValidationResult(typing.NamedTuple):
+    """The converted value and diagnostics produced while validating it."""
+
+    data: typing.Any
+    diagnostics: typing.Tuple[Diagnostic, ...]
+
+    @property
+    def valid(self) -> bool:
+        return True
+
+    @property
+    def value(self) -> typing.Any:
+        return self.data
+
+    @property
+    def warnings(self) -> typing.Tuple[Diagnostic, ...]:
+        return self.diagnostics
+
+
+_diagnostic_collector: ContextVar[
+    typing.Optional[typing.List[Diagnostic]]
+] = ContextVar('voluptuous_diagnostic_collector', default=None)
+
+
+def diagnostic_warning(
+    message: str,
+    path: typing.Optional[typing.Sequence[typing.Hashable]] = None,
+    code: typing.Optional[str] = None,
+    validator: typing.Any = None,
+) -> None:
+    """Emit a non-blocking diagnostic from a custom validator."""
+    collector = _diagnostic_collector.get()
+    if collector is not None:
+        collector.append(Diagnostic(message, tuple(path or ()), code, validator))
+
+
+def _diagnostic_checkpoint() -> typing.Tuple[
+    typing.Optional[typing.List[Diagnostic]], int
+]:
+    collector = _diagnostic_collector.get()
+    if collector is None:
+        return None, 0
+    return collector, len(collector)
+
+
+def _rollback_diagnostics(
+    checkpoint: typing.Tuple[typing.Optional[typing.List[Diagnostic]], int]
+) -> None:
+    collector, index = checkpoint
+    if collector is not None:
+        del collector[index:]
+
+
+@contextmanager
+def _diagnostic_branch() -> Generator[None, None, None]:
+    checkpoint = _diagnostic_checkpoint()
+    try:
+        yield
+    except Exception:
+        _rollback_diagnostics(checkpoint)
+        raise
 
 
 def Self() -> None:
@@ -85,6 +158,50 @@ Schemable = typing.Union[
     type, object, dict, None, typing.Callable
 ]
 # fmt: on
+
+
+class Warning(object):
+    """Attach a non-blocking diagnostic to a successful validator branch."""
+
+    __slots__ = ('schema', '_schema', 'message', 'code', '_compiled')
+
+    def __init__(
+        self,
+        schema: Schemable,
+        message: str = 'validation warning',
+        code: typing.Optional[str] = 'warning',
+    ) -> None:
+        self.schema = schema
+        self._schema = Schema(schema)
+        self.message = message
+        self.code = code
+        self._compiled = None
+
+    def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
+        self._compiled = schema._compile(self.schema)
+        return self._run
+
+    def _run(self, path: typing.List[typing.Hashable], value):
+        value = self._compiled(path, value)
+        diagnostic_warning(
+            self.message,
+            path,
+            code=self.code,
+            validator=self,
+        )
+        return value
+
+    def __call__(self, value):
+        value = self._schema(value)
+        diagnostic_warning(self.message, code=self.code, validator=self)
+        return value
+
+    def __repr__(self):
+        return 'Warning(%r, %r, code=%r)' % (self.schema, self.message, self.code)
+
+
+class DiagnosticWarning(Warning):
+    """Explicitly named validator for non-blocking diagnostic warnings."""
 
 
 class Schema(object):
@@ -208,6 +325,24 @@ class Schema(object):
         except er.Invalid as e:
             raise er.MultipleInvalid([e])
             # return self.validate([], self.schema, data)
+
+    def validate_with_diagnostics(self, data) -> ValidationResult:
+        """Validate data and return converted data with non-blocking diagnostics."""
+        diagnostics: typing.List[Diagnostic] = []
+        token = _diagnostic_collector.set(diagnostics)
+        try:
+            return ValidationResult(self(data), tuple(diagnostics))
+        finally:
+            _diagnostic_collector.reset(token)
+
+    def diagnose(self, data) -> ValidationResult:
+        return self.validate_with_diagnostics(data)
+
+    def validate_with_warnings(
+        self, data
+    ) -> typing.Tuple[typing.Any, typing.Tuple[Diagnostic, ...]]:
+        result = self.validate_with_diagnostics(data)
+        return result.data, result.diagnostics
 
     def _compile(self, schema):
         if schema is Extra:
@@ -337,32 +472,50 @@ class Schema(object):
                 # compare each given key/value against all compiled key/values
                 # schema key, (compiled key, compiled value)
                 error = None
+                remove_checkpoint = None
                 for skey, (ckey, cvalue) in relevant_candidates:
+                    candidate_checkpoint = _diagnostic_checkpoint()
+                    key_selected = False
                     try:
                         new_key = ckey(key_path, key)
+                        key_selected = True
                     except er.Invalid as e:
                         if len(e.path) > len(key_path):
                             raise
                         if not error or len(e.path) > len(error.path):
                             error = e
                         continue
+                    finally:
+                        if not key_selected:
+                            _rollback_diagnostics(candidate_checkpoint)
                     # Backtracking is not performed once a key is selected, so if
                     # the value is invalid we immediately throw an exception.
                     exception_errors = []
                     # check if the key is marked for removal
                     is_remove = new_key is Remove
+                    value_checkpoint = _diagnostic_checkpoint()
+                    value_selected = False
                     try:
                         cval = cvalue(key_path, value)
                         # include if it's not marked for removal
                         if not is_remove:
+                            if remove_checkpoint is not None:
+                                _rollback_diagnostics(remove_checkpoint)
                             out[new_key] = cval
+                            value_selected = True
                         else:
                             remove_key = True
+                            remove_checkpoint = candidate_checkpoint
                             continue
                     except er.MultipleInvalid as e:
                         exception_errors.extend(e.errors)
                     except er.Invalid as e:
                         exception_errors.append(e)
+                    finally:
+                        if is_remove and exception_errors:
+                            _rollback_diagnostics(candidate_checkpoint)
+                        if not value_selected and not is_remove:
+                            _rollback_diagnostics(value_checkpoint)
 
                     if exception_errors:
                         if is_remove or remove_key:
@@ -613,15 +766,21 @@ class Schema(object):
                 index_path = path + [i]
                 invalid = None
                 for validate in _compiled:
+                    candidate_checkpoint = _diagnostic_checkpoint()
+                    candidate_selected = False
                     try:
                         cval = validate(index_path, value)
                         if cval is not Remove:  # do not include Remove values
                             out.append(cval)
+                        candidate_selected = True
                         break
                     except er.Invalid as e:
                         if len(e.path) > len(index_path):
                             raise
                         invalid = e
+                    finally:
+                        if not candidate_selected:
+                            _rollback_diagnostics(candidate_checkpoint)
                 else:
                     errors.append(invalid)
             if errors:
@@ -689,13 +848,19 @@ class Schema(object):
             out = set()
             for value in data:
                 for validate in _compiled:
+                    candidate_checkpoint = _diagnostic_checkpoint()
+                    candidate_selected = False
                     try:
                         cval = validate(path, value)
                         if cval is not Remove:  # do not include Remove values
                             out.add(cval)
+                        candidate_selected = True
                         break
                     except er.Invalid:
                         pass
+                    finally:
+                        if not candidate_selected:
+                            _rollback_diagnostics(candidate_checkpoint)
                 else:
                     invalid = er.Invalid('invalid value in %s' % type_name, path)
                     errors.append(invalid)
@@ -1028,6 +1193,19 @@ class Marker(object):
         self.description = description
         self.__hash__ = cache(lambda: hash(schema_))  # type: ignore[method-assign]
 
+    def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
+        validate = schema._compile(self.schema)
+
+        def validate_marker(path, value):
+            try:
+                return validate(path, value)
+            except er.Invalid as e:
+                if self.msg and not (len(e.path) > len(path)):
+                    raise er.Invalid(self.msg, path)
+                raise
+
+        return validate_marker
+
     def __call__(self, v):
         try:
             return self._schema(v)
@@ -1253,6 +1431,47 @@ class Required(Marker):
         return []
 
 
+class Deprecated(Optional):
+    """Mark an accepted configuration key as deprecated."""
+
+    def __init__(
+        self,
+        schema: Schemable,
+        msg: typing.Optional[str] = None,
+        default: typing.Any = UNDEFINED,
+        description: typing.Any | None = None,
+        message: typing.Optional[str] = None,
+        code: str = 'deprecated',
+    ) -> None:
+        super(Deprecated, self).__init__(
+            schema,
+            msg=msg,
+            default=default,
+            description=description,
+        )
+        self.diagnostic_message = message
+        self.code = code
+
+    def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
+        validate = super(Deprecated, self).__voluptuous_compile__(schema)
+
+        def validate_deprecated(path, value):
+            value = validate(path, value)
+            diagnostic_warning(
+                self.diagnostic_message
+                or '%r is deprecated' % self.schema,
+                path,
+                code=self.code,
+                validator=self,
+            )
+            return value
+
+        return validate_deprecated
+
+    def __repr__(self):
+        return 'Deprecated(%r)' % (self.schema,)
+
+
 class Remove(Marker):
     """Mark a node in the schema to be removed and excluded from the validated
     output. Keys that fail validation will not raise ``Invalid``. Instead, these
@@ -1276,6 +1495,15 @@ class Remove(Marker):
     ) -> None:
         super().__init__(schema_, msg, description)
         self.__hash__ = cache(lambda: object.__hash__(self))  # type: ignore[method-assign]
+
+    def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
+        validate = super(Remove, self).__voluptuous_compile__(schema)
+
+        def validate_remove(path, value):
+            validate(path, value)
+            return Remove
+
+        return validate_remove
 
     def __call__(self, schema: Schemable):
         super(Remove, self).__call__(schema)
