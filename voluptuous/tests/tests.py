@@ -1,6 +1,7 @@
 # fmt: off
 import collections
 import copy
+import datetime
 import os
 from enum import Enum
 
@@ -19,6 +20,8 @@ from voluptuous import (
     ContainsInvalid,
     Date,
     Datetime,
+    DisjointIntervals,
+    DisjointIntervalsInvalid,
     Email,
     EmailInvalid,
     Equal,
@@ -2375,3 +2378,212 @@ def test_complex_required_keys_with_specific_value_validation():
     error_msg = str(exc_info.value)
     assert "required" not in error_msg.lower()  # No "required field missing" error
     assert "value must be at most 100" in error_msg  # Range validation error
+
+
+def test_disjoint_intervals_adjacent_half_open():
+    """Adjacent half-open intervals touch but do not overlap."""
+    schema = Schema(DisjointIntervals('start', 'end'))
+    bookings = [
+        {'start': 0, 'end': 10},
+        {'start': 10, 'end': 20},
+        {'start': 20, 'end': 30},
+    ]
+    assert schema(bookings) is bookings
+
+
+def test_disjoint_intervals_closed_touching_conflict():
+    """Closed endpoints touching at the boundary count as a conflict."""
+    schema = Schema(DisjointIntervals('start', 'end', end_included=True))
+    bookings = [
+        {'start': 0, 'end': 10},
+        {'start': 10, 'end': 20},
+    ]
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(bookings)
+    assert {tuple(e.path) for e in ctx.value.errors} == {(0, 'start'), (1, 'start')}
+    assert all(isinstance(e, DisjointIntervalsInvalid) for e in ctx.value.errors)
+
+
+def test_disjoint_intervals_nested():
+    """An interval fully nested inside another is a conflict."""
+    schema = Schema(DisjointIntervals('start', 'end'))
+    bookings = [
+        {'start': 0, 'end': 100},
+        {'start': 10, 'end': 20},
+    ]
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(bookings)
+    assert {tuple(e.path) for e in ctx.value.errors} == {(0, 'start'), (1, 'start')}
+
+
+def test_disjoint_intervals_group_by_resource():
+    """Only intervals in the same resource group are compared."""
+    schema = Schema(DisjointIntervals('start', 'end', group_by='resource'))
+    bookings = [
+        {'resource': 'room-a', 'start': 0, 'end': 10},
+        {'resource': 'room-b', 'start': 5, 'end': 15},
+        {'resource': 'room-a', 'start': 10, 'end': 20},
+    ]
+    assert schema(bookings) is bookings
+
+    bookings.append({'resource': 'room-b', 'start': 14, 'end': 16})
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(bookings)
+    assert {tuple(e.path) for e in ctx.value.errors} == {(1, 'start'), (3, 'start')}
+
+
+def test_disjoint_intervals_shuffled_input_keeps_original_indices():
+    """Errors point at the original record indices regardless of input order."""
+    schema = Schema(DisjointIntervals('start', 'end', group_by='resource'))
+    bookings = [
+        {'resource': 'b', 'start': 40, 'end': 50},
+        {'resource': 'a', 'start': 0, 'end': 10},
+        {'resource': 'b', 'start': 60, 'end': 70},
+        {'resource': 'a', 'start': 5, 'end': 8},
+        {'resource': 'b', 'start': 80, 'end': 90},
+    ]
+    snapshot = copy.deepcopy(bookings)
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(bookings)
+    assert {tuple(e.path) for e in ctx.value.errors} == {(1, 'start'), (3, 'start')}
+    messages = [e.msg for e in ctx.value.errors]
+    assert any('record 1' in m and 'record 3' in m for m in messages)
+    # The input list must not be sorted or mutated in place.
+    assert bookings == snapshot
+
+
+def test_disjoint_intervals_empty_interval():
+    schema = Schema(DisjointIntervals('start', 'end'))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema([{'start': 5, 'end': 5}])
+    assert 'empty interval' in str(ctx.value)
+    assert [tuple(e.path) for e in ctx.value.errors] == [(0, 'start')]
+
+    allow_empty = Schema(DisjointIntervals('start', 'end', allow_empty=True))
+    bookings = [{'start': 5, 'end': 5}]
+    assert allow_empty(bookings) is bookings
+
+
+def test_disjoint_intervals_start_after_end():
+    schema = Schema(DisjointIntervals('start', 'end'))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema([{'start': 10, 'end': 5}])
+    assert 'is after end' in str(ctx.value)
+    assert [tuple(e.path) for e in ctx.value.errors] == [(0, 'start')]
+
+
+def test_disjoint_intervals_unbounded_endpoints():
+    """None endpoints are unbounded and overlap anything on their side."""
+    schema = Schema(DisjointIntervals('start', 'end'))
+    bookings = [
+        {'start': None, 'end': 10},
+        {'start': 20, 'end': None},
+    ]
+    assert schema(bookings) is bookings
+
+    bookings.append({'start': 5, 'end': 6})
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(bookings)
+    assert {tuple(e.path) for e in ctx.value.errors} == {(0, 'start'), (2, 'start')}
+
+
+def test_disjoint_intervals_nullable_fields():
+    """Missing endpoint fields are nullable and treated as unbounded."""
+    schema = Schema(DisjointIntervals('start', 'end'))
+    bookings = [
+        {'start': 0, 'end': 10},
+        {'start': 20},  # no 'end': unbounded above
+    ]
+    assert schema(bookings) is bookings
+
+    bookings.append({'end': 30})  # no 'start': unbounded below
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(bookings)
+    # Record 2 spans (-inf, 30] and overlaps both previous records.
+    assert {tuple(e.path) for e in ctx.value.errors} == {
+        (0, 'start'),
+        (1, 'start'),
+        (2, 'start'),
+    }
+
+
+def test_disjoint_intervals_mixed_naive_aware_rejected():
+    """Mixing naive and aware datetimes is explicitly rejected."""
+    schema = Schema(DisjointIntervals('start', 'end'))
+    bookings = [
+        {
+            'start': datetime.datetime(2026, 1, 1, 8, 0),
+            'end': datetime.datetime(2026, 1, 1, 9, 0),
+        },
+        {
+            'start': datetime.datetime(2026, 1, 1, 10, 0, tzinfo=datetime.timezone.utc),
+            'end': datetime.datetime(2026, 1, 1, 11, 0, tzinfo=datetime.timezone.utc),
+        },
+    ]
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(bookings)
+    assert 'mixed naive and aware datetimes' in str(ctx.value)
+
+
+def test_disjoint_intervals_aware_datetimes_compare_as_instants():
+    """Aware datetimes in different timezones compare as the same instant."""
+    schema = Schema(DisjointIntervals('start', 'end'))
+    one_hour = datetime.timedelta(hours=1)
+    base = datetime.datetime(2026, 1, 1, 10, 0, tzinfo=datetime.timezone.utc)
+    bookings = [
+        {'start': base - one_hour, 'end': base},
+        # 11:00 at +01:00 is the same instant as 10:00 UTC: adjacent, not overlapping.
+        {
+            'start': base.astimezone(datetime.timezone(one_hour)),
+            'end': (base + one_hour).astimezone(datetime.timezone(one_hour)),
+        },
+    ]
+    assert schema(bookings) is bookings
+
+    closed = Schema(DisjointIntervals('start', 'end', end_included=True))
+    with pytest.raises(MultipleInvalid) as ctx:
+        closed(bookings)
+    assert {tuple(e.path) for e in ctx.value.errors} == {(0, 'start'), (1, 'start')}
+
+
+def test_disjoint_intervals_endpoint_sub_schema():
+    """Endpoints are cleaned with the given sub-schema before comparison."""
+    schema = Schema(DisjointIntervals('start', 'end', schema=Coerce(int)))
+    bookings = [
+        {'start': '0', 'end': '10'},
+        {'start': '10', 'end': '20'},
+    ]
+    assert schema(bookings) is bookings
+
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema([{'start': '0', 'end': '10'}, {'start': '5', 'end': '15'}])
+    assert {tuple(e.path) for e in ctx.value.errors} == {(0, 'start'), (1, 'start')}
+
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema([{'start': 'not-a-number', 'end': '10'}])
+    assert [tuple(e.path) for e in ctx.value.errors] == [(0, 'start')]
+
+
+def test_disjoint_intervals_inside_larger_schema():
+    """Paths are prefixed correctly when used in a parent schema."""
+    schema = Schema(
+        {
+            'bookings': All(
+                [{'resource': str, 'start': int, 'end': int}],
+                DisjointIntervals('start', 'end', group_by='resource'),
+            )
+        }
+    )
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(
+            {
+                'bookings': [
+                    {'resource': 'a', 'start': 0, 'end': 10},
+                    {'resource': 'a', 'start': 5, 'end': 15},
+                ]
+            }
+        )
+    assert {tuple(e.path) for e in ctx.value.errors} == {
+        ('bookings', 0, 'start'),
+        ('bookings', 1, 'start'),
+    }

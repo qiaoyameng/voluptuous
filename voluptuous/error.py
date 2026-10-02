@@ -178,6 +178,10 @@ class DirInvalid(Invalid):
     """The value is not a directory."""
 
 
+class DisjointIntervalsInvalid(Invalid):
+    """Intervals of records in a sequence overlap or are malformed."""
+
+
 class PathInvalid(Invalid):
     """The value is not a path."""
 

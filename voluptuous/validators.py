@@ -1,6 +1,7 @@
 # fmt: off
 from __future__ import annotations
 
+import collections.abc
 import datetime
 import os
 import re
@@ -18,6 +19,7 @@ from voluptuous.error import (
     DateInvalid,
     DatetimeInvalid,
     DirInvalid,
+    DisjointIntervalsInvalid,
     EmailInvalid,
     ExactSequenceInvalid,
     FalseInvalid,
@@ -31,6 +33,7 @@ from voluptuous.error import (
     NotInInvalid,
     PathInvalid,
     RangeInvalid,
+    SequenceTypeInvalid,
     TooManyValid,
     TrueInvalid,
     TypeInvalid,
@@ -991,6 +994,319 @@ class Unique(object):
 
     def __repr__(self):
         return 'Unique()'
+
+
+class DisjointIntervals(object):
+    """Ensure that records in a sequence define non-overlapping intervals.
+
+    Typical use is checking that bookings for the same resource do not
+    overlap. Records are grouped with ``group_by`` and only intervals
+    belonging to the same group are checked against each other.
+
+    Endpoints are cleaned with the optional ``schema`` sub-schema before
+    any comparison takes place. After cleaning:
+
+    - An endpoint of ``None`` (or a missing, hence nullable, field) is an
+      unbounded endpoint; it extends to infinity on its side of the
+      interval and is always considered open.
+    - An interval whose start is after its end is invalid.
+    - An interval whose start equals its end is an *empty interval* and
+      is invalid unless ``allow_empty`` is true.
+
+    ``start_included`` and ``end_included`` configure whether endpoints
+    are part of the interval. With the defaults (start included, end
+    excluded) intervals may touch: ``[1, 2)`` and ``[2, 3)`` do not
+    overlap, while with both ends included they would.
+
+    Aware datetimes are normalized to UTC so that all time endpoints
+    compare as instants. Mixing naive and aware datetimes is rejected
+    explicitly instead of being interpreted in the local timezone.
+
+    Overlaps are detected with an endpoint sweep rather than pairwise
+    comparison, and are reported as a ``MultipleInvalid`` holding one
+    ``DisjointIntervalsInvalid`` error per record per conflict. Each
+    error path points at the record's original index and start field;
+    the input sequence is never sorted or mutated in place.
+
+    :param start: Field name or callable returning the interval start.
+    :param end: Field name or callable returning the interval end.
+    :param group_by: Optional field name, callable, or sequence of those;
+        only records with equal group keys are checked against each other.
+    :param schema: Optional sub-schema used to clean each endpoint.
+    :param start_included: Whether the start endpoint is part of the interval.
+    :param end_included: Whether the end endpoint is part of the interval.
+    :param allow_empty: Whether intervals with equal endpoints are allowed.
+    :param msg: Message to deliver to user if intervals overlap.
+
+    >>> validate = Schema(DisjointIntervals('start', 'end'))
+    >>> validate([{'start': 1, 'end': 2}, {'start': 2, 'end': 3}])
+    [{'start': 1, 'end': 2}, {'start': 2, 'end': 3}]
+    >>> with raises(MultipleInvalid, regex='^interval .* of record 0 overlaps with record 1'):
+    ...   validate([{'start': 1, 'end': 3}, {'start': 2, 'end': 4}])
+    """
+
+    def __init__(
+        self,
+        start: typing.Union[typing.Hashable, typing.Callable],
+        end: typing.Union[typing.Hashable, typing.Callable],
+        group_by: typing.Optional[
+            typing.Union[typing.Hashable, typing.Callable, typing.Sequence]
+        ] = None,
+        schema: typing.Optional[Schemable] = None,
+        start_included: bool = True,
+        end_included: bool = False,
+        allow_empty: bool = False,
+        msg: typing.Optional[str] = None,
+    ) -> None:
+        self.start = start
+        self.end = end
+        if group_by is None:
+            self.group_by: tuple = ()
+        elif isinstance(group_by, (list, tuple)):
+            self.group_by = tuple(group_by)
+        else:
+            self.group_by = (group_by,)
+        self.endpoint_schema = schema
+        self.start_included = start_included
+        self.end_included = end_included
+        self.allow_empty = allow_empty
+        self.msg = msg
+        self._compiled_endpoint: typing.Optional[typing.Callable] = None
+        self._standalone_endpoint: typing.Optional[Schema] = None
+
+    def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
+        if self.endpoint_schema is not None:
+            self._compiled_endpoint = schema._compile(self.endpoint_schema)
+        return self._run
+
+    def _run(self, path: typing.List[typing.Hashable], value):
+        return self._validate(value, path)
+
+    def __call__(self, v):
+        return self._validate(v, [])
+
+    @staticmethod
+    def _resolve(field, record):
+        """Resolve a field spec against a record.
+
+        Fields are nullable: a missing field resolves to ``None``, i.e.
+        an unbounded endpoint.
+        """
+        if callable(field):
+            return field(record)
+        try:
+            return record[field]
+        except (KeyError, IndexError):
+            return None
+        except TypeError:
+            return getattr(record, field, None)
+
+    @staticmethod
+    def _field_path(field) -> typing.List[typing.Hashable]:
+        return [] if callable(field) else [field]
+
+    @staticmethod
+    def _freeze(value):
+        """Convert a group key component into something hashable."""
+        try:
+            hash(value)
+        except TypeError:
+            if isinstance(value, dict):
+                return tuple(
+                    sorted((k, DisjointIntervals._freeze(v)) for k, v in value.items())
+                )
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return tuple(DisjointIntervals._freeze(v) for v in value)
+            return repr(value)
+        return value
+
+    @staticmethod
+    def _normalize_endpoint(value):
+        """Return ``(value, aware)`` unifying time endpoints as instants.
+
+        ``aware`` is ``True``/``False`` for datetimes and ``None`` for
+        anything else. Aware datetimes are converted to UTC so that they
+        compare as absolute instants.
+        """
+        if isinstance(value, datetime.datetime):
+            if value.tzinfo is not None and value.utcoffset() is not None:
+                return value.astimezone(datetime.timezone.utc), True
+            return value, False
+        return value, None
+
+    def _clean_endpoint(self, path, value):
+        if self.endpoint_schema is None or value is None:
+            return value
+        if self._compiled_endpoint is not None:
+            return self._compiled_endpoint(path, value)
+        if self._standalone_endpoint is None:
+            self._standalone_endpoint = Schema(self.endpoint_schema)
+        try:
+            return self._standalone_endpoint(value)
+        except MultipleInvalid as e:
+            e.prepend(path)
+            raise
+
+    def _validate(self, v, path: typing.List[typing.Hashable]):
+        if isinstance(v, (str, bytes, dict)) or not isinstance(
+            v, collections.abc.Iterable
+        ):
+            raise SequenceTypeInvalid(
+                self.msg or 'expected a sequence of records', path
+            )
+        records = list(v)
+
+        errors: typing.List[Invalid] = []
+        intervals = []
+        awareness = None
+        for index, record in enumerate(records):
+            endpoints = []
+            for field in (self.start, self.end):
+                field_path = path + [index] + self._field_path(field)
+                raw = self._resolve(field, record)
+                try:
+                    cleaned = self._clean_endpoint(field_path, raw)
+                except Invalid as e:
+                    if isinstance(e, MultipleInvalid):
+                        errors.extend(e.errors)
+                    else:
+                        errors.append(e)
+                    cleaned = None
+                value, aware = self._normalize_endpoint(cleaned)
+                if aware is not None:
+                    if awareness is None:
+                        awareness = aware
+                    elif awareness != aware:
+                        errors.append(
+                            DisjointIntervalsInvalid(
+                                self.msg
+                                or 'mixed naive and aware datetimes are not comparable',
+                                field_path,
+                            )
+                        )
+                endpoints.append(value)
+            intervals.append(tuple(endpoints))
+        if errors:
+            raise MultipleInvalid(errors)
+
+        for index, (low, high) in enumerate(intervals):
+            if low is None or high is None:
+                continue
+            field_path = path + [index] + self._field_path(self.start)
+            try:
+                if low > high:
+                    errors.append(
+                        DisjointIntervalsInvalid(
+                            self.msg
+                            or 'interval start %r is after end %r' % (low, high),
+                            field_path,
+                        )
+                    )
+                elif low == high and not self.allow_empty:
+                    errors.append(
+                        DisjointIntervalsInvalid(
+                            self.msg
+                            or 'empty interval: start %r is equal to end %r'
+                            % (low, high),
+                            field_path,
+                        )
+                    )
+            except TypeError:
+                errors.append(
+                    DisjointIntervalsInvalid(
+                        self.msg
+                        or 'interval endpoints %r and %r are not comparable'
+                        % (low, high),
+                        field_path,
+                    )
+                )
+        if errors:
+            raise MultipleInvalid(errors)
+
+        groups: typing.Dict[typing.Hashable, typing.List[int]] = {}
+        for index, record in enumerate(records):
+            key = tuple(
+                self._freeze(self._resolve(field, record)) for field in self.group_by
+            )
+            groups.setdefault(key, []).append(index)
+
+        conflicts: typing.List[Invalid] = []
+        for indices in groups.values():
+            conflicts.extend(self._find_conflicts(indices, intervals, path))
+        if conflicts:
+            raise MultipleInvalid(conflicts)
+        return v
+
+    def _conflict_error(self, index, other_index, intervals, path):
+        low, high = intervals[index]
+        return DisjointIntervalsInvalid(
+            self.msg
+            or 'interval (%r, %r) of record %d overlaps with record %d'
+            % (low, high, index, other_index),
+            path + [index] + self._field_path(self.start),
+        )
+
+    def _find_conflicts(self, indices, intervals, path):
+        # Sweep endpoints sorted by interval start; the input order is
+        # never touched, only a copy of (start, original index) pairs.
+        try:
+            ordered = sorted(
+                ((intervals[i][0], i) for i in indices),
+                key=lambda item: (item[0] is not None, item[0], item[1]),
+            )
+        except TypeError:
+            return [
+                DisjointIntervalsInvalid(
+                    self.msg or 'interval endpoints are not mutually comparable',
+                    path + [indices[0]] + self._field_path(self.start),
+                )
+            ]
+
+        errors = []
+        touch_counts = self.start_included and self.end_included
+        active = []
+        for low, index in ordered:
+            high = intervals[index][1]
+            still_active = []
+            for other_high, other_index in active:
+                if other_high is None or low is None:
+                    overlap, evict = True, False
+                else:
+                    try:
+                        if other_high > low:
+                            overlap, evict = True, False
+                        elif other_high == low:
+                            overlap, evict = touch_counts, not touch_counts
+                        else:
+                            overlap, evict = False, True
+                    except TypeError:
+                        errors.append(
+                            DisjointIntervalsInvalid(
+                                self.msg
+                                or 'interval endpoints are not mutually comparable',
+                                path + [index] + self._field_path(self.start),
+                            )
+                        )
+                        continue
+                if overlap:
+                    errors.append(
+                        self._conflict_error(other_index, index, intervals, path)
+                    )
+                    errors.append(
+                        self._conflict_error(index, other_index, intervals, path)
+                    )
+                if not evict:
+                    still_active.append((other_high, other_index))
+            still_active.append((high, index))
+            active = still_active
+        return errors
+
+    def __repr__(self):
+        return 'DisjointIntervals(%r, %r, group_by=%r)' % (
+            self.start,
+            self.end,
+            self.group_by,
+        )
 
 
 class Equal(object):
