@@ -38,7 +38,13 @@ from voluptuous.error import (
 )
 
 # F401: flake8 complains about 'raises' not being used, but it is used in doctests
-from voluptuous.schema_builder import Schema, Schemable, message, raises  # noqa: F401
+from voluptuous.schema_builder import (  # noqa: F401
+    Schema,
+    Schemable,
+    _diagnostic_branch,
+    message,
+    raises,
+)
 
 if typing.TYPE_CHECKING:
     from _typeshed import SupportsAllComparisons
@@ -250,9 +256,9 @@ class _WithSubValidators(object):
         self.discriminant = discriminant
 
     def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
-        self._compiled = []
         old_required = schema.required
         self.schema = schema
+        self._compiled = []
         for v in self.validators:
             schema.required = self.required
             self._compiled.append(schema._compile(v))
@@ -260,13 +266,14 @@ class _WithSubValidators(object):
         return self._run
 
     def _run(self, path: typing.List[typing.Hashable], value):
+        compiled = self._compiled
         if self.discriminant is not None:
-            self._compiled = [
+            compiled = [
                 self.schema._compile(v)
                 for v in self.discriminant(value, self.validators)
             ]
 
-        return self._exec(self._compiled, value, path)
+        return self._exec(compiled, value, path)
 
     def __call__(self, v):
         return self._exec((Schema(val) for val in self.validators), v)
@@ -317,9 +324,11 @@ class Any(_WithSubValidators):
         for func in funcs:
             try:
                 if path is None:
-                    return func(v)
+                    with _diagnostic_branch():
+                        return func(v)
                 else:
-                    return func(path, v)
+                    with _diagnostic_branch():
+                        return func(path, v)
             except Invalid as e:
                 if error is None or len(e.path) > len(error.path):
                     error = e
@@ -359,9 +368,11 @@ class Union(_WithSubValidators):
         for func in funcs:
             try:
                 if path is None:
-                    return func(v)
+                    with _diagnostic_branch():
+                        return func(v)
                 else:
-                    return func(path, v)
+                    with _diagnostic_branch():
+                        return func(path, v)
             except Invalid as e:
                 if error is None or len(e.path) > len(error.path):
                     error = e
@@ -389,12 +400,14 @@ class All(_WithSubValidators):
     """
 
     def _exec(self, funcs, v, path=None):
+        branch = _diagnostic_branch()
         try:
-            for func in funcs:
-                if path is None:
-                    v = func(v)
-                else:
-                    v = func(path, v)
+            with branch:
+                for func in funcs:
+                    if path is None:
+                        v = func(v)
+                    else:
+                        v = func(path, v)
         except Invalid as e:
             raise e if self.msg is None else AllInvalid(self.msg, path=path)
         return v

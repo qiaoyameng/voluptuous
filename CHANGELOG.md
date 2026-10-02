@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+**New**:
+
+* Add `Schema.validate_with_diagnostics()`, `Warning`, and `Deprecated` for non-blocking, path-aware diagnostics
+
 **Fixes**:
 
 * [#539](https://github.com/alecthomas/voluptuous/pull/539): Raise `Invalid` instead of leaking `TypeError`/`ValueError` for non-numeric input to the `Number` validator

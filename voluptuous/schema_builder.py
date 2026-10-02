@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import collections
+import contextvars
 import enum
 import inspect
 import itertools
 import re
 import typing
 from collections.abc import Generator
+from contextlib import AbstractContextManager
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import cache, wraps
 
 from voluptuous import error as er
@@ -42,6 +45,97 @@ def Self() -> None:
 
 
 DefaultFactory = typing.Union[Undefined, typing.Callable[[], typing.Any]]
+
+
+@dataclass(frozen=True)
+class Diagnostic:
+    """A non-blocking diagnostic produced during validation."""
+
+    code: str
+    message: str
+    path: typing.Tuple[typing.Hashable, ...] = ()
+
+
+class ValidationResult:
+    """The result of validation with non-blocking diagnostics."""
+
+    __slots__ = ('data', 'diagnostics')
+
+    def __init__(
+        self, data: typing.Any, diagnostics: typing.Tuple[Diagnostic, ...]
+    ) -> None:
+        self.data = data
+        self.diagnostics = diagnostics
+
+    @property
+    def warnings(self) -> typing.Tuple[Diagnostic, ...]:
+        return self.diagnostics
+
+    def __iter__(self):
+        yield self.data
+        yield self.diagnostics
+
+    def __getitem__(self, index):
+        return tuple(self)[index]
+
+    def __len__(self) -> int:
+        return 2
+
+    def __eq__(self, other):
+        if isinstance(other, ValidationResult):
+            return (
+                self.data == other.data and self.diagnostics == other.diagnostics
+            )
+        if isinstance(other, tuple):
+            return tuple(self) == other
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return 'ValidationResult(data=%r, diagnostics=%r)' % (
+            self.data,
+            self.diagnostics,
+        )
+
+
+class _DiagnosticCollector:
+    __slots__ = ('diagnostics',)
+
+    def __init__(self) -> None:
+        self.diagnostics: typing.List[Diagnostic] = []
+
+    def add(self, diagnostic: Diagnostic) -> None:
+        self.diagnostics.append(diagnostic)
+
+
+_diagnostic_context: contextvars.ContextVar[
+    typing.Optional[_DiagnosticCollector]
+] = contextvars.ContextVar('voluptuous_diagnostics', default=None)
+
+
+def _add_diagnostic(
+    code: str, message: str, path: typing.List[typing.Hashable]
+) -> None:
+    diagnostics = _diagnostic_context.get()
+    if diagnostics is not None:
+        diagnostics.add(Diagnostic(code, message, tuple(path)))
+
+
+class _DiagnosticBranch(AbstractContextManager):
+    def __init__(self) -> None:
+        self._collector = _diagnostic_context.get()
+        self._checkpoint = len(self._collector.diagnostics) if self._collector else 0
+
+    def rollback(self) -> None:
+        if self._collector is not None:
+            del self._collector.diagnostics[self._checkpoint :]
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if exc_type is not None:
+            self.rollback()
+
+
+def _diagnostic_branch() -> _DiagnosticBranch:
+    return _DiagnosticBranch()
 
 
 def default_factory(value) -> DefaultFactory:
@@ -209,6 +303,25 @@ class Schema(object):
             raise er.MultipleInvalid([e])
             # return self.validate([], self.schema, data)
 
+    def validate_with_diagnostics(self, data) -> ValidationResult:
+        """Validate data and return converted data with non-blocking diagnostics."""
+        collector = _DiagnosticCollector()
+        token = _diagnostic_context.set(collector)
+        try:
+            try:
+                validated = self._compiled([], data)
+            except er.MultipleInvalid:
+                raise
+            except er.Invalid as e:
+                raise er.MultipleInvalid([e])
+        finally:
+            _diagnostic_context.reset(token)
+        return ValidationResult(validated, tuple(collector.diagnostics))
+
+    def validate_with_warnings(self, data) -> ValidationResult:
+        """Alias for :meth:`validate_with_diagnostics`."""
+        return self.validate_with_diagnostics(data)
+
     def _compile(self, schema):
         if schema is Extra:
             return lambda _, v: v
@@ -338,9 +451,11 @@ class Schema(object):
                 # schema key, (compiled key, compiled value)
                 error = None
                 for skey, (ckey, cvalue) in relevant_candidates:
+                    branch = _diagnostic_branch()
                     try:
                         new_key = ckey(key_path, key)
                     except er.Invalid as e:
+                        branch.rollback()
                         if len(e.path) > len(key_path):
                             raise
                         if not error or len(e.path) > len(error.path):
@@ -365,6 +480,7 @@ class Schema(object):
                         exception_errors.append(e)
 
                     if exception_errors:
+                        branch.rollback()
                         if is_remove or remove_key:
                             continue
                         for err in exception_errors:
@@ -613,12 +729,14 @@ class Schema(object):
                 index_path = path + [i]
                 invalid = None
                 for validate in _compiled:
+                    branch = _diagnostic_branch()
                     try:
                         cval = validate(index_path, value)
                         if cval is not Remove:  # do not include Remove values
                             out.append(cval)
                         break
                     except er.Invalid as e:
+                        branch.rollback()
                         if len(e.path) > len(index_path):
                             raise
                         invalid = e
@@ -689,12 +807,14 @@ class Schema(object):
             out = set()
             for value in data:
                 for validate in _compiled:
+                    branch = _diagnostic_branch()
                     try:
                         cval = validate(path, value)
                         if cval is not Remove:  # do not include Remove values
                             out.add(cval)
                         break
                     except er.Invalid:
+                        branch.rollback()
                         pass
                 else:
                     invalid = er.Invalid('invalid value in %s' % type_name, path)
@@ -1277,12 +1397,76 @@ class Remove(Marker):
         super().__init__(schema_, msg, description)
         self.__hash__ = cache(lambda: object.__hash__(self))  # type: ignore[method-assign]
 
+    def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
+        validate = schema._compile(self.schema)
+
+        def validate_remove(path: typing.List[typing.Hashable], value):
+            validate(path, value)
+            return self.__class__
+
+        return validate_remove
+
     def __call__(self, schema: Schemable):
         super(Remove, self).__call__(schema)
         return self.__class__
 
     def __repr__(self):
         return "Remove(%r)" % (self.schema,)
+
+
+class Warning(Marker):
+    """Accept a value while reporting a non-blocking diagnostic."""
+
+    __slots__ = ('code',)
+
+    def __init__(
+        self,
+        schema_: Schemable = object,
+        msg: typing.Optional[str] = None,
+        code: str = 'warning',
+        description: typing.Any | None = None,
+    ) -> None:
+        super().__init__(schema_, msg=msg, description=description)
+        self.code = code
+
+    def __voluptuous_compile__(self, schema: Schema) -> typing.Callable:
+        validate = schema._compile(self.schema)
+        message = self._default_message()
+
+        def validate_warning(path: typing.List[typing.Hashable], value):
+            value = validate(path, value)
+            _add_diagnostic(self.code, message, path)
+            return value
+
+        return validate_warning
+
+    def _default_message(self) -> str:
+        return self.msg or 'value raised a validation warning'
+
+
+class Deprecated(Warning):
+    """Accept a value while reporting a deprecation diagnostic."""
+
+    def __init__(
+        self,
+        schema_: Schemable = object,
+        msg: typing.Optional[str] = None,
+        code: str = 'deprecated',
+        description: typing.Any | None = None,
+    ) -> None:
+        super().__init__(schema_, msg, code, description)
+
+    def _default_message(self) -> str:
+        message = self.msg
+        if message is None:
+            if self.schema is object or inspect.isclass(self.schema):
+                message = 'value is deprecated and may be removed in a future release'
+            else:
+                message = (
+                    '%r is deprecated and may be removed in a future release'
+                    % (self.schema,)
+                )
+        return message
 
 
 def message(

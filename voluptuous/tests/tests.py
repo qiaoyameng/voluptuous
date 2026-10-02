@@ -2,6 +2,7 @@
 import collections
 import copy
 import os
+import threading
 from enum import Enum
 
 import pytest
@@ -19,6 +20,8 @@ from voluptuous import (
     ContainsInvalid,
     Date,
     Datetime,
+    Deprecated,
+    Diagnostic,
     Email,
     EmailInvalid,
     Equal,
@@ -60,6 +63,8 @@ from voluptuous import (
     Unordered,
     Url,
     UrlInvalid,
+    ValidationResult,
+    Warning,
     raises,
     validate,
 )
@@ -2375,3 +2380,195 @@ def test_complex_required_keys_with_specific_value_validation():
     error_msg = str(exc_info.value)
     assert "required" not in error_msg.lower()  # No "required field missing" error
     assert "value must be at most 100" in error_msg  # Range validation error
+
+
+def test_diagnostics_are_ordered_and_non_blocking():
+    schema = Schema(
+        {
+            'outer': {
+                'old': Deprecated(str, 'old is deprecated'),
+                'new': str,
+            },
+            'items': [Deprecated(int, 'integer is deprecated')],
+        }
+    )
+
+    result = schema.validate_with_diagnostics(
+        {'outer': {'old': 'a', 'new': 'b'}, 'items': [1]}
+    )
+
+    assert isinstance(result, ValidationResult)
+    assert result.data == {
+        'outer': {'old': 'a', 'new': 'b'},
+        'items': [1],
+    }
+    assert result.diagnostics == (
+        Diagnostic('deprecated', 'old is deprecated', ('outer', 'old')),
+        Diagnostic('deprecated', 'integer is deprecated', ('items', 0)),
+    )
+    assert schema(result.data) == result.data
+
+
+def test_warning_rule_reports_custom_non_blocking_diagnostic():
+    schema = Schema({Warning('flag', 'flag is legacy'): int})
+
+    result = schema.validate_with_diagnostics({'flag': 1})
+
+    assert result.data == {'flag': 1}
+    assert result.warnings == (
+        Diagnostic('warning', 'flag is legacy', ('flag',)),
+    )
+
+
+def test_invalid_still_blocks_diagnostic_validation():
+    schema = Schema({'old': Deprecated(str), Required('new'): str})
+
+    with pytest.raises(MultipleInvalid):
+        schema.validate_with_diagnostics({'old': 'value'})
+
+
+def test_failed_any_branch_does_not_leave_diagnostics():
+    schema = Schema(
+        {
+            'config': Any(
+                {
+                    'legacy': Deprecated(str),
+                    Required('unsupported'): object,
+                },
+                {'kind': 'deprecated', Deprecated('legacy'): str},
+                {'kind': 'modern', Extra: object},
+            )
+        }
+    )
+
+    successful_candidate_result = schema.validate_with_diagnostics(
+        {'config': {'legacy': 'enabled', 'modern': 'enabled'}}
+    )
+    selected_deprecation_result = schema.validate_with_diagnostics(
+        {'config': {'kind': 'deprecated', 'legacy': 'enabled'}}
+    )
+
+    assert successful_candidate_result.data == {
+        'config': {'legacy': 'enabled', 'modern': 'enabled'}
+    }
+    assert successful_candidate_result.diagnostics == ()
+    assert selected_deprecation_result.diagnostics == (
+        Diagnostic(
+            'deprecated',
+            "'legacy' is deprecated and may be removed in a future release",
+            ('config', 'legacy'),
+        ),
+    )
+    assert selected_deprecation_result.data == {
+        'config': {'kind': 'deprecated', 'legacy': 'enabled'}
+    }
+    assert set(successful_candidate_result.diagnostics) != set(
+        selected_deprecation_result.diagnostics
+    )
+
+
+def test_object_diagnostics_use_original_attribute_path():
+    class Settings:
+        def __init__(self, legacy=None):
+            self.legacy = legacy
+
+    schema = Schema(
+        Object({'legacy': Deprecated(str, 'legacy is deprecated')}, cls=Settings)
+    )
+
+    result = schema.validate_with_diagnostics(Settings(legacy='enabled'))
+
+    assert isinstance(result.data, Settings)
+    assert result.data.legacy == 'enabled'
+    assert result.diagnostics == (
+        Diagnostic('deprecated', 'legacy is deprecated', ('legacy',)),
+    )
+
+
+def test_failed_all_branch_rolls_back_diagnostics():
+    schema = Schema(
+        Any(
+            All(Deprecated(int, 'integer is deprecated'), Range(min=10)),
+            object,
+        )
+    )
+
+    result = schema.validate_with_diagnostics(1)
+
+    assert result.data == 1
+    assert result.diagnostics == ()
+
+
+def test_remove_diagnostics_use_original_path():
+    schema = Schema(
+        {'keep': str, Remove(Deprecated('old', 'old is deprecated')): object}
+    )
+
+    result = schema.validate_with_diagnostics({'keep': 'value', 'old': 1})
+
+    assert result.data == {'keep': 'value'}
+    assert result.diagnostics == (
+        Diagnostic('deprecated', 'old is deprecated', ('old',)),
+    )
+
+
+def test_failed_remove_candidate_rolls_back_diagnostics():
+    def invalid(value):
+        raise Invalid('remove candidate failed')
+
+    mapping_schema = Schema(
+        {Remove(All(Deprecated('old'), invalid)): int, 'other': str},
+        extra=ALLOW_EXTRA,
+    )
+    mapping_result = mapping_schema.validate_with_diagnostics(
+        {'old': 1, 'other': 'value'}
+    )
+    assert mapping_result.data == {'old': 1, 'other': 'value'}
+    assert mapping_result.diagnostics == ()
+
+    sequence_schema = Schema(
+        [int, Remove(All(Deprecated(object), invalid)), str]
+    )
+    sequence_result = sequence_schema.validate_with_diagnostics(['value'])
+    assert sequence_result.data == ['value']
+    assert sequence_result.diagnostics == ()
+
+
+def test_schema_can_be_reused_concurrently_with_diagnostics():
+    schema = Schema(
+        Any(
+            All(Deprecated(int, 'integer is deprecated'), Range(min=0)),
+            Deprecated(str, 'string is deprecated'),
+        )
+    )
+    results = {}
+    errors = []
+
+    def validate_in_thread(index):
+        try:
+            value = index if index % 2 == 0 else str(index)
+            results[index] = schema.validate_with_diagnostics(value)
+        except Invalid as e:
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=validate_in_thread, args=(index,))
+        for index in range(40)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    for index, result in results.items():
+        if index % 2 == 0:
+            assert result.data == index
+            assert result.diagnostics == (
+                Diagnostic('deprecated', 'integer is deprecated', ()),
+            )
+        else:
+            assert result.data == str(index)
+            assert result.diagnostics == (
+                Diagnostic('deprecated', 'string is deprecated', ()),
+            )

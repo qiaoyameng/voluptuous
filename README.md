@@ -626,6 +626,31 @@ an HTTP API.
 'This email is invalid.'
 ```
 
+### Non-blocking diagnostics
+
+Use `Deprecated` to continue accepting an old configuration field while
+reporting a structured warning. `Schema(data)` keeps its existing behavior and
+returns only the converted data. `schema.validate_with_diagnostics(data)`
+returns a `ValidationResult` containing the converted data and an ordered
+tuple of `Diagnostic` objects.
+
+```python
+schema = Schema({"old_name": Deprecated(str, "old_name is deprecated")})
+result = schema.validate_with_diagnostics({"old_name": "value"})
+
+result.data
+# {'old_name': 'value'}
+result.diagnostics
+# (Diagnostic(code='deprecated',
+#             message='old_name is deprecated',
+#             path=('old_name',)),)
+result.warnings  # alias for result.diagnostics
+```
+
+Diagnostics are collected only from the successful validation branch.
+Candidates that raise `Invalid` leave no diagnostics behind, and a final
+`Invalid` still raises `MultipleInvalid`.
+
 The `path` attribute is used during error reporting, but also during matching
 to determine whether an error should be reported to the user or if the next
 match should be attempted. This is determined by comparing the depth of the
@@ -843,4 +868,3 @@ using voluptuous validators in `assert`s.
 
 I greatly prefer the light-weight style promoted by these libraries to
 the complexity of libraries like FormEncode.
-
