@@ -210,6 +210,12 @@ class ExactSequenceInvalid(Invalid):
     pass
 
 
+class SequencePatternInvalid(Invalid):
+    """The sequence did not match the declared term pattern."""
+
+    pass
+
+
 class NotEnoughValid(Invalid):
     """The value did not pass enough validations."""
 

@@ -25,6 +25,7 @@ from voluptuous import (
     ExactSequence,
     Exclusive,
     Extra,
+    Fixed,
     FqdnUrl,
     In,
     Inclusive,
@@ -44,15 +45,19 @@ from voluptuous import (
     NotInInvalid,
     Number,
     Object,
+    Opt,
     Optional,
     PathExists,
     Range,
     Remove,
+    Rep,
     Replace,
     Required,
     Schema,
     SchemaError,
     Self,
+    SequencePattern,
+    SequencePatternInvalid,
     SomeOf,
     TooManyValid,
     TypeInvalid,
@@ -84,6 +89,148 @@ def test_exact_sequence():
     with raises(Invalid):
         schema([1, 2, 3])
     assert schema([1, 2]) == [1, 2]
+
+
+def test_sequence_pattern_basic():
+    schema = Schema(
+        SequencePattern(
+            [Fixed('HEAD'), Opt('MARK'), Rep(int, min=1, max=3), Fixed('TAIL')]
+        )
+    )
+    assert schema(['HEAD', 'MARK', 1, 2, 'TAIL']) == ['HEAD', 'MARK', 1, 2, 'TAIL']
+    # marker absent
+    assert schema(['HEAD', 1, 'TAIL']) == ['HEAD', 1, 'TAIL']
+    # input type is preserved
+    assert schema(('HEAD', 1, 'TAIL')) == ('HEAD', 1, 'TAIL')
+    with raises(Invalid):
+        schema('HEAD')
+
+
+def test_sequence_pattern_declaration_errors():
+    with raises(SchemaError):
+        Rep(int, min=2, max=1)
+    with raises(SchemaError):
+        Rep(int, min=-1)
+    # the repeated term and the fixed tail both accept 0xFF
+    with raises(SchemaError):
+        SequencePattern([Rep(Any(0x01, 0xFF), min=1), Fixed(0xFF)])
+    # a record-shaped tail is indistinguishable from a record
+    with raises(SchemaError):
+        SequencePattern([Rep({'kind': int}, min=1), Fixed({'kind': 9})])
+    # terms must be term objects
+    with raises(SchemaError):
+        SequencePattern([int])
+    with raises(SchemaError):
+        SequencePattern([])
+    # disjoint repetition and tail are fine
+    Schema(SequencePattern([Rep(int, min=1), Fixed('TAIL')]))
+
+
+def test_sequence_pattern_boundary_segmentation():
+    # {'kind': 0, ...} satisfies both the marker and the record schema;
+    # the leftmost term (the optional marker) claims it.
+    marker = {'kind': 0, 'payload': int}
+    record = {'kind': int, 'payload': int}
+    pattern = SequencePattern(
+        [Fixed('HEAD'), Opt(marker), Rep(record, min=1), Fixed('TAIL')]
+    )
+    schema = Schema(pattern)
+    both = {'kind': 0, 'payload': 9}
+    data = ['HEAD', both, {'kind': 3, 'payload': 1}, 'TAIL']
+    assert schema(data) == data
+    assert pattern.explain(data) == [
+        ('fixed', 0, 1),
+        ('optional', 1, 2),
+        ('repeat', 2, 3),
+        ('fixed', 3, 4),
+    ]
+    # once the marker slot is taken, an identical element becomes a record
+    data = ['HEAD', both, both, 'TAIL']
+    assert pattern.explain(data)[2] == ('repeat', 2, 3)
+    assert schema(data) == data
+    # a plain record is not marker-shaped, so the marker stays absent
+    data = ['HEAD', {'kind': 3, 'payload': 1}, 'TAIL']
+    assert pattern.explain(data)[1] == ('optional', 1, 1)
+    assert schema(data) == data
+
+
+def test_sequence_pattern_missing_tail():
+    schema = Schema(SequencePattern([Fixed('HEAD'), Rep(int, min=1), Fixed('TAIL')]))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(['HEAD', 1, 2])
+    error = ctx.value.errors[0]
+    assert isinstance(error, SequencePatternInvalid)
+    assert error.path == [3]
+
+
+def test_sequence_pattern_not_enough_records():
+    schema = Schema(SequencePattern([Fixed('HEAD'), Rep(int, min=2), Fixed('TAIL')]))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(['HEAD', 1, 'TAIL'])
+    error = ctx.value.errors[0]
+    assert isinstance(error, SequencePatternInvalid)
+    assert error.path == [2]
+
+
+def test_sequence_pattern_empty_input():
+    schema = Schema(SequencePattern([Fixed('HEAD'), Rep(int), Fixed('TAIL')]))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema([])
+    assert ctx.value.path == [0]
+    # an all-optional pattern accepts empty input
+    assert Schema(SequencePattern([Opt('A'), Rep(int)]))([]) == []
+
+
+def test_sequence_pattern_overlong_input():
+    schema = Schema(SequencePattern([Fixed('HEAD'), Rep(int, max=2), Fixed('TAIL')]))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(['HEAD', 1, 'TAIL', 'EXTRA'])
+    error = ctx.value.errors[0]
+    assert isinstance(error, SequencePatternInvalid)
+    assert error.path == [3]
+
+
+def test_sequence_pattern_inner_field_failure_keeps_index():
+    record = {'kind': int, 'payload': All(int, Range(0, 10))}
+    schema = Schema(SequencePattern([Fixed('HEAD'), Rep(record, min=1), Fixed('TAIL')]))
+    data = ['HEAD', {'kind': 1, 'payload': 5}, {'kind': 2, 'payload': 99}, 'TAIL']
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(data)
+    # the original index of the bad record is preserved, not shifted
+    assert ctx.value.path == [2, 'payload']
+
+
+def test_sequence_pattern_converters_run_once_in_conversion_phase():
+    calls = []
+
+    def convert(v):
+        calls.append(v)
+        return v * 2
+
+    schema = Schema(
+        SequencePattern(
+            [
+                Fixed('HEAD'),
+                Rep(All(int, convert), min=1, match=lambda v: isinstance(v, int)),
+                Fixed('TAIL'),
+            ]
+        )
+    )
+    assert schema(['HEAD', 1, 2, 3, 'TAIL']) == ['HEAD', 2, 4, 6, 'TAIL']
+    # each element converted exactly once, never re-run for backtracking
+    assert calls == [1, 2, 3]
+    # a segmentation failure never touches the converters at all
+    del calls[:]
+    with pytest.raises(MultipleInvalid):
+        schema(['HEAD', 1, 2])
+    assert calls == []
+
+
+def test_sequence_pattern_custom_message():
+    schema = Schema(SequencePattern([Fixed('HEAD')], msg='bad frame'))
+    with pytest.raises(MultipleInvalid) as ctx:
+        schema(['NOPE'])
+    assert str(ctx.value) == 'bad frame'
 
 
 def test_required():

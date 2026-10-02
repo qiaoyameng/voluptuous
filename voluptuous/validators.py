@@ -1,6 +1,7 @@
 # fmt: off
 from __future__ import annotations
 
+import collections.abc
 import datetime
 import os
 import re
@@ -31,6 +32,8 @@ from voluptuous.error import (
     NotInInvalid,
     PathInvalid,
     RangeInvalid,
+    SchemaError,
+    SequencePatternInvalid,
     TooManyValid,
     TrueInvalid,
     TypeInvalid,
@@ -38,7 +41,13 @@ from voluptuous.error import (
 )
 
 # F401: flake8 complains about 'raises' not being used, but it is used in doctests
-from voluptuous.schema_builder import Schema, Schemable, message, raises  # noqa: F401
+from voluptuous.schema_builder import (  # noqa: F401
+    Marker,
+    Schema,
+    Schemable,
+    message,
+    raises,
+)
 
 if typing.TYPE_CHECKING:
     from _typeshed import SupportsAllComparisons
@@ -947,6 +956,328 @@ class ExactSequence(object):
 
     def __repr__(self):
         return 'ExactSequence([%s])' % ", ".join(repr(v) for v in self.validators)
+
+
+def _is_literal(schema) -> bool:
+    """Whether a schema is a plain literal value (matched by equality)."""
+    return not isinstance(
+        schema, (type, list, tuple, dict, set, frozenset, Marker)
+    ) and not callable(schema)
+
+
+def _compile_probe(schema) -> typing.Callable[[typing.Any], bool]:
+    """Derive a pure matching predicate from a schema.
+
+    The probe is used only to segment the input sequence; it never runs
+    converters or any other user code with side effects.  Probes are
+    permissive: a probe may accept values the final schema rejects (those
+    are reported during the conversion phase), but it must never reject a
+    value the final schema would accept.
+
+    Raises SchemaError if no pure probe can be derived; in that case the
+    caller must supply an explicit ``match`` predicate.
+    """
+    if isinstance(schema, type):
+        return lambda v: isinstance(v, schema)
+    if isinstance(schema, dict):
+        checks = []
+        for key, subschema in schema.items():
+            if isinstance(key, Marker) or not _is_literal(key):
+                continue
+            if isinstance(subschema, type):
+                checks.append((key, lambda v, k=key, t=subschema: isinstance(v[k], t)))
+            elif _is_literal(subschema):
+                checks.append((key, lambda v, k=key, lit=subschema: v[k] == lit))
+            else:
+                checks.append((key, lambda v: True))
+
+        def dict_probe(v, checks=checks):
+            if not isinstance(v, collections.abc.Mapping):
+                return False
+            return all(key in v and check(v) for key, check in checks)
+
+        return dict_probe
+    if isinstance(schema, list):
+        return lambda v: isinstance(v, list)
+    if isinstance(schema, tuple):
+        return lambda v: isinstance(v, tuple)
+    if isinstance(schema, (set, frozenset)):
+        return lambda v: isinstance(v, (set, frozenset))
+    if isinstance(schema, (Any, Union)):
+        probes = [_compile_probe(sub) for sub in schema.validators]
+        return lambda v: any(probe(v) for probe in probes)
+    if isinstance(schema, All):
+        probes = [_compile_probe(sub) for sub in schema.validators]
+        return lambda v: all(probe(v) for probe in probes)
+    if _is_literal(schema):
+        return lambda v: v == schema
+    raise SchemaError(
+        'cannot derive a pure matcher from %r; '
+        'pass an explicit match= predicate for this term' % (schema,)
+    )
+
+
+def _literal_candidates(schema) -> typing.List:
+    """Best-effort extraction of concrete values a schema can match.
+
+    Used at declaration time to exhibit elements that two adjacent terms
+    would both claim.  Returns an empty list when nothing can be proven.
+    """
+    if isinstance(schema, (Any, Union, All)):
+        candidates: typing.List = []
+        for subschema in schema.validators:
+            candidates.extend(_literal_candidates(subschema))
+        return candidates
+    if isinstance(schema, dict):
+        candidate = {}
+        for key, subschema in schema.items():
+            if (
+                isinstance(key, Marker)
+                or not _is_literal(key)
+                or not _is_literal(subschema)
+            ):
+                return []
+            candidate[key] = subschema
+        return [candidate] if candidate else []
+    if _is_literal(schema):
+        return [schema]
+    return []
+
+
+class _SequenceTerm(object):
+    """One term of a SequencePattern: wraps the schema used for the final
+    conversion and the pure predicate used for matching."""
+
+    kind = 'term'
+
+    def __init__(
+        self,
+        schema: Schemable,
+        match: typing.Optional[typing.Callable[[typing.Any], bool]] = None,
+    ) -> None:
+        self.schema = schema
+        if match is not None:
+            if not callable(match):
+                raise SchemaError('match must be a callable predicate')
+            self.probe = match
+        else:
+            self.probe = _compile_probe(schema)
+
+    def __repr__(self):
+        return '%s(%r)' % (self.__class__.__name__, self.schema)
+
+
+class Fixed(_SequenceTerm):
+    """Matches exactly one element."""
+
+    kind = 'fixed'
+
+
+class Opt(_SequenceTerm):
+    """Matches zero or one element."""
+
+    kind = 'optional'
+
+
+class Rep(_SequenceTerm):
+    """Matches a repetition of between ``min`` and ``max`` elements.
+
+    ``max=None`` means unbounded.  A Rep with ``min == max`` consumes a
+    fixed number of elements.
+    """
+
+    kind = 'repeat'
+
+    def __init__(
+        self,
+        schema: Schemable,
+        min: int = 0,
+        max: typing.Optional[int] = None,
+        match: typing.Optional[typing.Callable[[typing.Any], bool]] = None,
+    ) -> None:
+        if min < 0:
+            raise SchemaError('min must be >= 0')
+        if max is not None and max < min:
+            raise SchemaError('max must be >= min')
+        self.min = min
+        self.max = max
+        super().__init__(schema, match=match)
+
+    def __repr__(self):
+        return 'Rep(%r, min=%r, max=%r)' % (self.schema, self.min, self.max)
+
+
+class SequencePattern(object):
+    """Match a sequence against a pattern of fixed, optional and repeated
+    terms, e.g. a decoded binary protocol frame: a fixed header, an
+    optional marker, one or more records and a fixed tail.
+
+    :param terms: An iterable of Fixed, Opt and Rep terms.
+    :param msg: Message to deliver to user if validation fails.
+    :param kwargs: All other keyword arguments are passed to the sub-schema
+        constructors.
+
+    Validation runs in two strictly separated phases:
+
+    1. Matching: a single left-to-right pass segments the raw input using
+       only pure predicates (derived from the term schemas, or given via
+       ``match=``).  Converters are never executed in this phase, so
+       side-effecting validators are never run speculatively and no
+       backtracking takes place.
+    2. Conversion: each element is converted exactly once by its term's
+       schema.  Errors are reported with the element's original index, so
+       a failing inner conversion never shifts the positions of
+       subsequent errors.
+
+    Segmentation rule (longest match): each Rep consumes the longest run
+    of elements its matcher accepts, and when an element could be claimed
+    by more than one term, the leftmost term wins.  Because of this, a
+    variable-width Rep must be distinguishable from the term that follows
+    it: if a concrete value is found that both accept, the pattern is
+    rejected with a SchemaError at declaration time.
+
+    Empty and overlong inputs are rejected as soon as the single pass
+    detects them.
+
+    >>> from voluptuous import Schema, SequencePattern, Fixed, Opt, Rep, Coerce
+    >>> validate = Schema(SequencePattern([
+    ...     Fixed('HEAD'),
+    ...     Opt('MARK'),
+    ...     Rep(Coerce(int), min=1, match=str.isdigit),
+    ...     Fixed('TAIL'),
+    ... ]))
+    >>> validate(['HEAD', 'MARK', '1', '2', 'TAIL'])
+    ['HEAD', 'MARK', 1, 2, 'TAIL']
+    >>> validate(['HEAD', '3', 'TAIL'])
+    ['HEAD', 3, 'TAIL']
+    >>> validate(['HEAD', 'TAIL'])
+    Traceback (most recent call last):
+    ...
+    voluptuous.error.MultipleInvalid: expected at least 1 element(s) matching Coerce(int, msg=None), got 0 @ data[1]
+    """
+
+    def __init__(
+        self,
+        terms: typing.Iterable[_SequenceTerm],
+        msg: typing.Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        self.terms = list(terms)
+        if not self.terms:
+            raise SchemaError('SequencePattern requires at least one term')
+        for term in self.terms:
+            if not isinstance(term, _SequenceTerm):
+                raise SchemaError(
+                    'SequencePattern terms must be Fixed, Opt or Rep '
+                    'instances, got %r' % (term,)
+                )
+        self.msg = msg
+        self._schemas = [Schema(term.schema, **kwargs) for term in self.terms]
+        self._check_ambiguity()
+
+    def _check_ambiguity(self) -> None:
+        """Reject patterns a single left-to-right pass cannot segment.
+
+        A variable-width Rep greedily consumes every element its probe
+        accepts, so the following term must start with something the Rep
+        would not consume.  If a concrete value acceptable to both can be
+        exhibited, the pattern is ambiguous and rejected here.
+        """
+        for index, (term, following) in enumerate(zip(self.terms, self.terms[1:])):
+            if not isinstance(term, Rep):
+                continue
+            if term.max is not None and term.max == term.min:
+                continue
+            candidates = _literal_candidates(term.schema)
+            candidates += _literal_candidates(following.schema)
+            for candidate in candidates:
+                if term.probe(candidate) and following.probe(candidate):
+                    raise SchemaError(
+                        'ambiguous sequence pattern: term %d (%r) and term %d '
+                        '(%r) both accept %r; make the repeated elements '
+                        'distinguishable from what follows'
+                        % (index, term, index + 1, following, candidate)
+                    )
+
+    def _segment(self, v):
+        """Segment v into (term_index, start, end) runs without converting."""
+        segments = []
+        pos = 0
+        size = len(v)
+        for index, term in enumerate(self.terms):
+            if isinstance(term, Fixed):
+                if pos >= size or not term.probe(v[pos]):
+                    raise SequencePatternInvalid(
+                        'expected element matching %r at position %d'
+                        % (term.schema, pos),
+                        path=[pos],
+                    )
+                segments.append((index, pos, pos + 1))
+                pos += 1
+            elif isinstance(term, Opt):
+                if pos < size and term.probe(v[pos]):
+                    segments.append((index, pos, pos + 1))
+                    pos += 1
+                else:
+                    segments.append((index, pos, pos))
+            else:
+                start = pos
+                while (
+                    pos < size
+                    and (term.max is None or pos - start < term.max)
+                    and term.probe(v[pos])
+                ):
+                    pos += 1
+                if pos - start < term.min:
+                    raise SequencePatternInvalid(
+                        'expected at least %d element(s) matching %r, got %d'
+                        % (term.min, term.schema, pos - start),
+                        path=[pos],
+                    )
+                segments.append((index, start, pos))
+        if pos != size:
+            raise SequencePatternInvalid(
+                'unexpected element at position %d' % pos, path=[pos]
+            )
+        return segments
+
+    def explain(self, v):
+        """Return the segmentation of v as (kind, start, end) tuples, one
+        per term, without converting anything.
+
+        >>> from voluptuous import SequencePattern, Fixed, Opt, Rep
+        >>> pattern = SequencePattern([Fixed('H'), Opt('M'), Rep(int, min=1)])
+        >>> pattern.explain(['H', 'M', 1, 2])
+        [('fixed', 0, 1), ('optional', 1, 2), ('repeat', 2, 4)]
+        """
+        if not isinstance(v, (list, tuple)):
+            raise SequencePatternInvalid('expected a list or tuple')
+        return [
+            (self.terms[index].kind, start, end)
+            for index, start, end in self._segment(v)
+        ]
+
+    def __call__(self, v):
+        if not isinstance(v, (list, tuple)):
+            raise SequencePatternInvalid(self.msg or 'expected a list or tuple')
+        try:
+            segments = self._segment(v)
+        except SequencePatternInvalid as e:
+            raise e if self.msg is None else SequencePatternInvalid(self.msg)
+        result = []
+        for (index, start, end), schema in zip(segments, self._schemas):
+            for i in range(start, end):
+                try:
+                    result.append(schema(v[i]))
+                except Invalid as e:
+                    if self.msg is not None:
+                        raise SequencePatternInvalid(self.msg)
+                    e.prepend([i])
+                    raise
+        return type(v)(result)
+
+    def __repr__(self):
+        return 'SequencePattern([%s])' % ", ".join(repr(t) for t in self.terms)
 
 
 class Unique(object):
